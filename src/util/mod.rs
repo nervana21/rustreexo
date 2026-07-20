@@ -6,6 +6,12 @@ use alloc::collections::BTreeSet;
 use super::node_hash::AccumulatorHash;
 use crate::prelude::*;
 
+/// Returns the bitmask of valid position bits for a forest with `forest_rows` rows.
+fn position_mask(forest_rows: u8) -> u64 {
+    debug_assert!(forest_rows < 64);
+    ((2_u128 << forest_rows) - 1) as u64
+}
+
 // isRootPosition checks if the current position is a root given the number of
 // leaves and the entire rows of the forest.
 pub fn is_root_position(position: u64, num_leaves: u64, forest_rows: u8) -> bool {
@@ -20,11 +26,11 @@ pub fn is_root_position(position: u64, num_leaves: u64, forest_rows: u8) -> bool
 // removeBit removes the nth bit from the val passed in. For example, if the 2nd
 // bit is to be removed from 1011 (11 in dec), the returned value is 111 (7 in dec).
 pub fn remove_bit(val: u64, bit: u64) -> u64 {
-    let mask = ((2 << bit) - 1) as u64;
+    let mask = ((2_u128 << bit) - 1) as u64;
     let upper_mask = u64::MAX ^ mask;
     let upper = val & upper_mask;
 
-    let mask = ((1 << bit) - 1) as u64;
+    let mask = ((1_u128 << bit) - 1) as u64;
     let lower_mask = !(u64::MAX ^ mask);
     let lower = val & lower_mask;
 
@@ -89,7 +95,7 @@ pub fn calc_next_pos(position: u64, del_pos: u64, forest_rows: u8) -> Result<u64
 
     // This is the bit to be prepended.
     let to_row = pos_row + 1;
-    let higher_bits = (1 << to_row) << (forest_rows - to_row) as u64;
+    let higher_bits = ((1_u128 << to_row) << (forest_rows - to_row) as u32) as u64;
 
     // Put the bits together and return it.
     Ok(higher_bits | lower_bits)
@@ -232,8 +238,10 @@ pub fn detect_offset(pos: u64, num_leaves: u64) -> (u8, u8, u64) {
     // covered by that tree from the position, and proceed to the next tree,
     // skipping trees that don't exist.
 
-    while (marker << nr) & ((2 << tr) - 1) >= (1 << tr) & num_leaves {
-        let tree_size = (1 << tr) & num_leaves;
+    while (((marker as u128) << nr) & ((2_u128 << tr) - 1))
+        >= ((1_u64 << tr) & num_leaves) as u128
+    {
+        let tree_size = (1_u64 << tr) & num_leaves;
         if tree_size != 0 {
             marker -= tree_size;
             bigger_trees += 1;
@@ -252,8 +260,10 @@ pub fn detect_offset_pollard(pos: u64, num_leaves: u64) -> (u8, u8, u64) {
     let mut root_idx = tr;
     let mut marker = pos;
 
-    while ((marker << nr) & ((2 << tr) - 1)) >= ((1 << tr) & num_leaves) {
-        let tree_size = (1 << tr) & num_leaves;
+    while (((marker as u128) << nr) & ((2_u128 << tr) - 1))
+        >= ((1_u64 << tr) & num_leaves) as u128
+    {
+        let tree_size = (1_u64 << tr) & num_leaves;
         marker -= tree_size;
         root_idx -= 1;
         tr -= 1;
@@ -262,8 +272,8 @@ pub fn detect_offset_pollard(pos: u64, num_leaves: u64) -> (u8, u8, u64) {
 }
 
 pub fn children(pos: u64, forest_rows: u8) -> u64 {
-    let mask = (2 << forest_rows) - 1;
-    (pos << 1) & mask
+    let mask = position_mask(forest_rows);
+    ((pos as u128) << 1) as u64 & mask
 }
 pub fn left_child(pos: u64, forest_rows: u8) -> u64 {
     children(pos, forest_rows)
@@ -282,7 +292,7 @@ pub fn max_position_at_row(row: u8, total_rows: u8, num_leaves: u64) -> Result<u
 }
 // parent returns the parent position of the passed in child
 pub fn parent(pos: u64, forest_rows: u8) -> u64 {
-    (pos >> 1) | (1 << forest_rows)
+    (pos >> 1) | (1_u64 << forest_rows)
 }
 
 pub fn read_u64<Source: Read>(buf: &mut Source) -> Result<u64, io::Error> {
@@ -304,11 +314,11 @@ pub fn tree_rows(n: u64) -> u8 {
 // root_position returns the position of the root at a given row
 // TODO undefined behavior if the given row doesn't have a root
 pub fn root_position(num_leaves: u64, row: u8, forest_rows: u8) -> u64 {
-    let mask = (2 << forest_rows) - 1;
-    let before = num_leaves & (mask << (row + 1));
-
-    let shifted = (before >> row) | (mask << (forest_rows + 1 - row));
-    shifted & mask
+    let mask = position_mask(forest_rows);
+    let mask_u128 = mask as u128;
+    let before = (num_leaves as u128) & (mask_u128 << (row + 1));
+    let shifted = (before >> row) | (mask_u128 << (forest_rows + 1 - row));
+    (shifted & mask_u128) as u64
 }
 pub fn parent_many(pos: u64, rise: u8, forest_rows: u8) -> Result<u64, String> {
     if rise == 0 {
@@ -320,7 +330,7 @@ pub fn parent_many(pos: u64, rise: u8, forest_rows: u8) -> Result<u64, String> {
         ));
     }
 
-    let mask = (2_u64 << forest_rows) - 1;
+    let mask = position_mask(forest_rows);
     Ok((pos >> rise | (mask << (forest_rows - (rise - 1)) as u64)) & mask)
 }
 
@@ -445,6 +455,13 @@ mod tests {
 
         let pos = super::root_position(5, 0, 3);
         assert_eq!(pos, 4);
+
+        assert_eq!(super::root_position(5, 2, 63), 13835058055282163712);
+        assert_eq!(super::root_position(1 << 62, 0, 63), 1 << 62);
+        assert_eq!(super::root_position(1 << 62, 63, 63), u64::MAX - 1);
+        assert_eq!(super::parent(0, 63), 1 << 63);
+        assert_eq!(super::children(44, 63), 88);
+        assert_eq!(super::children(u64::MAX - 1, 63), u64::MAX - 3);
     }
 
     #[test]
