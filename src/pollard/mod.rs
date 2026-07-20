@@ -51,6 +51,7 @@ use core::mem;
 use super::node_hash::AccumulatorHash;
 use super::proof::Proof;
 use super::stump::Stump;
+use super::util::detect_offset_pollard;
 use super::util::detect_row;
 use super::util::detwin;
 use super::util::get_proof_positions;
@@ -989,20 +990,7 @@ impl<Hash: AccumulatorHash> Pollard<Hash> {
     }
 
     fn detect_offset(pos: u64, num_leaves: u64) -> (u8, u8, u64) {
-        let mut tr = tree_rows(num_leaves);
-        let nr = detect_row(pos, tr);
-
-        let mut bigger_trees = tr;
-        let mut marker = pos;
-
-        while ((marker << nr) & ((2 << tr) - 1)) >= ((1 << tr) & num_leaves) {
-            let tree_size = (1 << tr) & num_leaves;
-            marker -= tree_size;
-            bigger_trees -= 1;
-
-            tr -= 1;
-        }
-        (bigger_trees, (tr - nr), marker)
+        detect_offset_pollard(pos, num_leaves)
     }
 
     fn get_hash(&self, pos: u64) -> Result<Hash, PollardError<Hash>> {

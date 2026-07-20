@@ -244,6 +244,23 @@ pub fn detect_offset(pos: u64, num_leaves: u64) -> (u8, u8, u64) {
     (bigger_trees, tr - nr, !marker)
 }
 
+/// Locates `pos` in the forest for Pollard root-array indexing.
+pub fn detect_offset_pollard(pos: u64, num_leaves: u64) -> (u8, u8, u64) {
+    let mut tr = tree_rows(num_leaves);
+    let nr = detect_row(pos, tr);
+
+    let mut root_idx = tr;
+    let mut marker = pos;
+
+    while ((marker << nr) & ((2 << tr) - 1)) >= ((1 << tr) & num_leaves) {
+        let tree_size = (1 << tr) & num_leaves;
+        marker -= tree_size;
+        root_idx -= 1;
+        tr -= 1;
+    }
+    (root_idx, tr - nr, marker)
+}
+
 pub fn children(pos: u64, forest_rows: u8) -> u64 {
     let mask = (2 << forest_rows) - 1;
     (pos << 1) & mask
