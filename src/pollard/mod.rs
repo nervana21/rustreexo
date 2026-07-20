@@ -665,7 +665,7 @@ impl<Hash: AccumulatorHash> Pollard<Hash> {
     }
 
     pub fn prune(&mut self, positions: &[u64]) -> Result<(), PollardError<Hash>> {
-        self.prune_map(positions);
+        self.prune_map(positions)?;
 
         let positions = detwin(
             positions.to_vec(),
@@ -674,7 +674,7 @@ impl<Hash: AccumulatorHash> Pollard<Hash> {
         .map_err(|_| PollardError::InvalidPosition)?;
         for node in positions {
             let (node, _) = self
-                .grab_position(node)
+                .grab_position(node)?
                 .ok_or(PollardError::PositionNotFound(node))?;
 
             self.leaf_map.remove(&node.hash());
@@ -717,7 +717,7 @@ impl<Hash: AccumulatorHash> Pollard<Hash> {
 
         for pos in proof_positions.iter() {
             let hash = self
-                .grab_position(*pos)
+                .grab_position(*pos)?
                 .ok_or(PollardError::PositionNotFound(*pos))?
                 .0
                 .hash();
@@ -775,13 +775,13 @@ impl<Hash: AccumulatorHash> Pollard<Hash> {
         let targets = targets
             .iter()
             .map(|x| {
-                self.grab_position(*x)
+                self.grab_position(*x)?
                     .ok_or(PollardError::PositionNotFound(*x))
             })
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>, _>>()?;
 
         for del in targets {
-            self.delete_single(del?.0)?
+            self.delete_single(del.0)?
         }
 
         let mut add_nodes = Vec::new();
@@ -899,35 +899,51 @@ type AddSingleResult<T> = (Vec<(u64, T)>, Vec<usize>);
 type ChildrenTuple<Hash> = (Rc<PollardNode<Hash>>, Rc<PollardNode<Hash>>);
 
 impl<Hash: AccumulatorHash> Pollard<Hash> {
-    fn prune_map(&mut self, positions: &[u64]) {
+    fn prune_map(&mut self, positions: &[u64]) -> Result<(), PollardError<Hash>> {
         for pos in positions {
-            let node = self.grab_position(*pos).unwrap().0;
+            let node = self
+                .grab_position(*pos)?
+                .ok_or(PollardError::PositionNotFound(*pos))?
+                .0;
             self.leaf_map.remove(&node.hash());
         }
+        Ok(())
     }
 
-    fn grab_position(&self, pos: u64) -> Option<ChildrenTuple<Hash>> {
-        let (root, depth, bits) = Self::detect_offset(pos, self.leaves).ok()?;
-        let mut node = self.roots[root as usize].clone()?;
+    fn grab_position(
+        &self,
+        pos: u64,
+    ) -> Result<Option<ChildrenTuple<Hash>>, PollardError<Hash>> {
+        let (root, depth, bits) = Self::detect_offset(pos, self.leaves)?;
+        let Some(mut node) = self.roots[root as usize].clone() else {
+            return Ok(None);
+        };
 
         if depth == 0 {
-            return Some((node.clone(), node));
+            return Ok(Some((node.clone(), node)));
         }
 
         for row in 0..(depth - 1) {
             let next = if pos >> (depth - row - 1) & 1 == 1 {
-                node.left_niece()?
+                node.left_niece()
             } else {
-                node.right_niece()?
+                node.right_niece()
+            };
+            let Some(next) = next else {
+                return Ok(None);
             };
             node = next;
         }
 
-        Some(if bits & 1 == 0 {
-            (node.left_niece()?, node.right_niece()?)
+        let pair = if bits & 1 == 0 {
+            (node.left_niece(), node.right_niece())
         } else {
-            (node.right_niece()?, node.left_niece()?)
-        })
+            (node.right_niece(), node.left_niece())
+        };
+        match pair {
+            (Some(a), Some(b)) => Ok(Some((a, b))),
+            _ => Ok(None),
+        }
     }
 
     fn ingest_positions(
@@ -952,7 +968,7 @@ impl<Hash: AccumulatorHash> Pollard<Hash> {
 
             let aunt = parent(pos1, forest_rows).map_err(|_| PollardError::InvalidPosition)?;
             let aunt = self
-                .grab_position(aunt)
+                .grab_position(aunt)?
                 .ok_or(PollardError::AuntNotFound)?
                 .1;
 
@@ -1020,7 +1036,7 @@ impl<Hash: AccumulatorHash> Pollard<Hash> {
     }
 
     fn get_hash(&self, pos: u64) -> Result<Hash, PollardError<Hash>> {
-        match self.grab_position(pos) {
+        match self.grab_position(pos)? {
             Some(node) => Ok(node.0.hash()),
             None => Err(PollardError::PositionNotFound(pos)),
         }
@@ -1098,7 +1114,7 @@ impl<Hash: AccumulatorHash> Pollard<Hash> {
 
     fn prove_single_inner(&self, pos: u64) -> Result<Vec<Hash>, PollardError<Hash>> {
         let (node, sibling) = self
-            .grab_position(pos)
+            .grab_position(pos)?
             .ok_or(PollardError::PositionNotFound(pos))?;
         let mut proof = vec![sibling.hash()];
         let mut current = node;
@@ -1132,7 +1148,8 @@ impl<Hash: AccumulatorHash> Pollard<Hash> {
         let mut roots_to_destroy = Vec::new();
 
         while self.leaves >> row & 1 == 1 {
-            let old_root = mem::take(&mut self.roots[row as usize]).expect("Root not found");
+            let old_root = mem::take(&mut self.roots[row as usize])
+                .ok_or(PollardError::RootNotFound)?;
             let pos = root_position(
                 self.leaves(),
                 row,
@@ -1589,7 +1606,7 @@ mod tests {
 
         let mut p = Pollard::<BitcoinNodeHash>::new();
         p.modify(&hashes, &[], Proof::default()).unwrap();
-        p.delete_single(p.grab_position(1).unwrap().0)
+        p.delete_single(p.grab_position(1).unwrap().unwrap().0)
             .expect("Failed to delete");
 
         let root = p.roots[1].clone();
@@ -1746,7 +1763,7 @@ mod tests {
     fn test_get_pos() {
         macro_rules! test_get_pos {
             ($p:ident, $pos:literal) => {
-                let node = $p.grab_position($pos).unwrap().0;
+                let node = $p.grab_position($pos).unwrap().unwrap().0;
                 assert_eq!(
                     $p.get_pos(&Rc::downgrade(&node)),
                     Ok($pos),
@@ -1816,7 +1833,7 @@ mod tests {
         let new_proof = acc.prove_single(values[3].hash).unwrap();
         assert_eq!(new_proof, proof);
 
-        let node = acc.grab_position(3).unwrap().0;
+        let node = acc.grab_position(3).unwrap().unwrap().0;
         assert_eq!(node.hash(), hash_from_u8(3));
     }
 }
