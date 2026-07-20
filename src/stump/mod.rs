@@ -341,11 +341,11 @@ impl<Hash: AccumulatorHash> Stump<Hash> {
     ) -> Result<RootsNewAddAndDestroy<Hash>, StumpError> {
         let after_rows = util::tree_rows(leaves + (utxos.len() as u64));
         if after_rows >= 64 {
-            return Err(StumpError::InvalidProof(ProofError::InvalidTarget));
+            return Err(StumpError::InvalidProof(ProofError::InvalidPosition));
         }
         let mut updated_subtree: BTreeSet<(u64, Hash)> = BTreeSet::new();
         let all_deleted = util::roots_to_destroy(utxos.len() as u64, leaves, &roots)
-            .map_err(|_| StumpError::InvalidProof(ProofError::InvalidTarget))?;
+            .map_err(|_| StumpError::InvalidProof(ProofError::InvalidPosition))?;
 
         for (i, add) in utxos.iter().enumerate() {
             let mut pos = leaves;
@@ -353,18 +353,18 @@ impl<Hash: AccumulatorHash> Stump<Hash> {
             // deleted is the empty roots that are being added over. These force
             // the current root to move up.
             let deleted = util::roots_to_destroy((utxos.len() - i) as u64, leaves, &roots)
-                .map_err(|_| StumpError::InvalidProof(ProofError::InvalidTarget))?;
+                .map_err(|_| StumpError::InvalidProof(ProofError::InvalidPosition))?;
             for del in deleted {
                 if util::is_ancestor(
                     util::parent(del, after_rows)
-                        .map_err(|_| StumpError::InvalidProof(ProofError::InvalidTarget))?,
+                        .map_err(|_| StumpError::InvalidProof(ProofError::InvalidPosition))?,
                     pos,
                     after_rows,
                 )
-                .map_err(|_| StumpError::InvalidProof(ProofError::InvalidTarget))?
+                .map_err(|_| StumpError::InvalidProof(ProofError::InvalidPosition))?
                 {
                     pos = util::calc_next_pos(pos, del, after_rows)
-                        .map_err(|_| StumpError::InvalidProof(ProofError::InvalidTarget))?;
+                        .map_err(|_| StumpError::InvalidProof(ProofError::InvalidPosition))?;
                 }
             }
             let mut h = 0;
@@ -384,7 +384,7 @@ impl<Hash: AccumulatorHash> Stump<Hash> {
                         updated_subtree.insert((util::left_sibling(pos), root));
                         updated_subtree.insert((pos, to_add));
                         pos = util::parent(pos, after_rows)
-                            .map_err(|_| StumpError::InvalidProof(ProofError::InvalidTarget))?;
+                            .map_err(|_| StumpError::InvalidProof(ProofError::InvalidPosition))?;
 
                         to_add = AccumulatorHash::parent_hash(&root, &to_add);
                     }
