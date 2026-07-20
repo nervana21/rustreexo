@@ -6,26 +6,39 @@ use alloc::collections::BTreeSet;
 use super::node_hash::AccumulatorHash;
 use crate::prelude::*;
 
+fn check_forest_rows(forest_rows: u8) -> Result<(), String> {
+    if forest_rows >= 64 {
+        return Err(format!(
+            "forest_rows {forest_rows} exceeds u64 position bit width"
+        ));
+    }
+    Ok(())
+}
+
 /// Returns the bitmask of valid position bits for a forest with `forest_rows` rows.
-fn position_mask(forest_rows: u8) -> u64 {
-    debug_assert!(forest_rows < 64);
-    ((2_u128 << forest_rows) - 1) as u64
+fn position_mask(forest_rows: u8) -> Result<u64, String> {
+    check_forest_rows(forest_rows)?;
+    Ok(((2_u128 << forest_rows) - 1) as u64)
 }
 
 // isRootPosition checks if the current position is a root given the number of
 // leaves and the entire rows of the forest.
-pub fn is_root_position(position: u64, num_leaves: u64, forest_rows: u8) -> bool {
-    let row = detect_row(position, forest_rows);
+pub fn is_root_position(position: u64, num_leaves: u64, forest_rows: u8) -> Result<bool, String> {
+    let row = detect_row(position, forest_rows)?;
 
-    let root_present = num_leaves & (1 << row) != 0;
-    let root_pos = root_position(num_leaves, row, forest_rows);
+    let root_present = num_leaves & (1_u64 << row) != 0;
+    let root_pos = root_position(num_leaves, row, forest_rows)?;
 
-    root_present && root_pos == position
+    Ok(root_present && root_pos == position)
 }
 
 // removeBit removes the nth bit from the val passed in. For example, if the 2nd
 // bit is to be removed from 1011 (11 in dec), the returned value is 111 (7 in dec).
-pub fn remove_bit(val: u64, bit: u64) -> u64 {
+pub fn remove_bit(val: u64, bit: u64) -> Result<u64, String> {
+    if bit >= 64 {
+        return Err(format!("remove_bit: bit {bit} exceeds u64 bit width"));
+    }
+
     let mask = ((2_u128 << bit) - 1) as u64;
     let upper_mask = u64::MAX ^ mask;
     let upper = val & upper_mask;
@@ -34,7 +47,7 @@ pub fn remove_bit(val: u64, bit: u64) -> u64 {
     let lower_mask = !(u64::MAX ^ mask);
     let lower = val & lower_mask;
 
-    (upper >> 1) | lower
+    Ok((upper >> 1) | lower)
 }
 
 /// Translates targets from a forest with `from_rows` to a forest with `to_rows`.
@@ -70,19 +83,20 @@ pub fn remove_bit(val: u64, bit: u64) -> u64 {
 ///
 /// This function simply computes how far away from the start of the row this leaf is, then uses
 /// that to offset the same amount in the new structure.
-pub fn translate(pos: u64, from_rows: u8, to_rows: u8) -> u64 {
-    let row = detect_row(pos, from_rows);
+pub fn translate(pos: u64, from_rows: u8, to_rows: u8) -> Result<u64, String> {
+    check_forest_rows(to_rows)?;
+    let row = detect_row(pos, from_rows)?;
     if row == 0 {
-        return pos;
+        return Ok(pos);
     }
 
-    let offset = pos - start_position_at_row(row, from_rows);
-    offset + start_position_at_row(row, to_rows)
+    let offset = pos - start_position_at_row(row, from_rows)?;
+    Ok(offset + start_position_at_row(row, to_rows)?)
 }
 
 pub fn calc_next_pos(position: u64, del_pos: u64, forest_rows: u8) -> Result<u64, String> {
-    let del_row = detect_row(del_pos, forest_rows);
-    let pos_row = detect_row(position, forest_rows);
+    let del_row = detect_row(del_pos, forest_rows)?;
+    let pos_row = detect_row(position, forest_rows)?;
 
     if del_row < pos_row {
         return Err(format!(
@@ -91,17 +105,23 @@ pub fn calc_next_pos(position: u64, del_pos: u64, forest_rows: u8) -> Result<u64
     }
 
     // This is the lower bits where we'll remove the nth bit.
-    let lower_bits = remove_bit(position, (del_row - pos_row) as u64);
+    let lower_bits = remove_bit(position, (del_row - pos_row) as u64)?;
 
     // This is the bit to be prepended.
     let to_row = pos_row + 1;
+    if to_row > forest_rows {
+        return Err(format!(
+            "calc_next_pos: to_row {to_row} exceeds forest_rows {forest_rows}"
+        ));
+    }
+
     let higher_bits = ((1_u128 << to_row) << (forest_rows - to_row) as u32) as u64;
 
     // Put the bits together and return it.
     Ok(higher_bits | lower_bits)
 }
 
-pub fn detwin(nodes: Vec<u64>, forest_rows: u8) -> Vec<u64> {
+pub fn detwin(nodes: Vec<u64>, forest_rows: u8) -> Result<Vec<u64>, String> {
     let mut computed: Vec<u64> = nodes;
     let mut detwinned = Vec::new();
 
@@ -121,7 +141,7 @@ pub fn detwin(nodes: Vec<u64>, forest_rows: u8) -> Vec<u64> {
         };
 
         if next == sibling {
-            let parent = parent(node, forest_rows);
+            let parent = parent(node, forest_rows)?;
 
             if computed.binary_search(&parent).is_err() {
                 computed.push(parent);
@@ -134,16 +154,23 @@ pub fn detwin(nodes: Vec<u64>, forest_rows: u8) -> Vec<u64> {
         detwinned.push(node);
     }
 
-    detwinned
+    Ok(detwinned)
 }
 
 // start_position_at_row returns the smallest position an accumulator can have for the
 // requested row for the given numLeaves.
-pub fn start_position_at_row(row: u8, forest_rows: u8) -> u64 {
+pub fn start_position_at_row(row: u8, forest_rows: u8) -> Result<u64, String> {
+    check_forest_rows(forest_rows)?;
+    if row > forest_rows {
+        return Err(format!(
+            "start_position_at_row: row {row} exceeds forest_rows {forest_rows}"
+        ));
+    }
+
     // 2 << forest_rows is 2 more than the max position
     // to get the correct offset for a given row,
     // subtract (2 << `row complement of forest_rows`) from (2 << forest_rows)
-    ((2_u128 << forest_rows) - (2_u128 << (forest_rows - row))) as u64
+    Ok(((2_u128 << forest_rows) - (2_u128 << (forest_rows - row))) as u64)
 }
 
 pub fn is_left_niece(position: u64) -> bool {
@@ -160,9 +187,9 @@ pub fn roots_to_destroy<Hash: AccumulatorHash>(
     num_adds: u64,
     mut num_leaves: u64,
     orig_roots: &[Hash],
-) -> Vec<u64> {
+) -> Result<Vec<u64>, String> {
     if !orig_roots.iter().any(|root| root.is_empty()) {
-        return vec![];
+        return Ok(vec![]);
     }
 
     let mut roots = orig_roots.to_vec();
@@ -175,7 +202,7 @@ pub fn roots_to_destroy<Hash: AccumulatorHash>(
                 .expect("If (num_leaves >> h) & 1 == 1, it must have at least one root left");
             if root.is_empty() {
                 let root_pos =
-                    root_position(num_leaves, h, tree_rows(num_leaves + (num_adds - add)));
+                    root_position(num_leaves, h, tree_rows(num_leaves + (num_adds - add)))?;
                 deleted.push(root_pos);
             }
             h += 1;
@@ -185,7 +212,7 @@ pub fn roots_to_destroy<Hash: AccumulatorHash>(
         num_leaves += 1;
     }
 
-    deleted
+    Ok(deleted)
 }
 
 pub fn num_roots(leaves: u64) -> usize {
@@ -193,7 +220,8 @@ pub fn num_roots(leaves: u64) -> usize {
 }
 // detectRow finds the current row of a node, given the position
 // and the total forest rows.
-pub fn detect_row(pos: u64, forest_rows: u8) -> u8 {
+pub fn detect_row(pos: u64, forest_rows: u8) -> Result<u8, String> {
+    check_forest_rows(forest_rows)?;
     let mut marker: u64 = 1 << forest_rows;
     let mut h: u8 = 0;
 
@@ -202,12 +230,18 @@ pub fn detect_row(pos: u64, forest_rows: u8) -> u8 {
         h += 1;
     }
 
-    h
+    if h > forest_rows {
+        return Err(format!(
+            "detect_row: position {pos} implies row {h} exceeds forest_rows {forest_rows}"
+        ));
+    }
+
+    Ok(h)
 }
 
-pub fn detect_offset(pos: u64, num_leaves: u64) -> (u8, u8, u64) {
+pub fn detect_offset(pos: u64, num_leaves: u64) -> Result<(u8, u8, u64), String> {
     let mut tr = tree_rows(num_leaves);
-    let nr = detect_row(pos, tr);
+    let nr = detect_row(pos, tr)?;
 
     let mut bigger_trees: u8 = 0;
     let mut marker = pos;
@@ -243,19 +277,45 @@ pub fn detect_offset(pos: u64, num_leaves: u64) -> (u8, u8, u64) {
     {
         let tree_size = (1_u64 << tr) & num_leaves;
         if tree_size != 0 {
-            marker -= tree_size;
+            marker = marker
+                .checked_sub(tree_size)
+                .ok_or_else(|| format!("detect_offset: marker underflow for position {pos}"))?;
             bigger_trees += 1;
+        }
+        if tr == 0 {
+            return Err(format!(
+                "detect_offset: position {pos} exceeds forest for {num_leaves} leaves"
+            ));
         }
         tr -= 1;
     }
 
-    (bigger_trees, tr - nr, !marker)
+    if tr < nr {
+        return Err(format!(
+            "detect_offset: row underflow for position {pos} with {num_leaves} leaves"
+        ));
+    }
+
+    Ok((bigger_trees, tr - nr, !marker))
 }
 
 /// Locates `pos` in the forest for Pollard root-array indexing.
-pub fn detect_offset_pollard(pos: u64, num_leaves: u64) -> (u8, u8, u64) {
+///
+/// Same tree-walk as [`detect_offset`], but returns values Pollard needs to
+/// descend from `roots[root_idx]`:
+///
+/// - **`root_idx`**: row of the tree that contains `pos` (indexes
+///   [`Pollard`](crate::pollard::Pollard)'s root slot). Starts at
+///   `tree_rows(num_leaves)` and decrements once per skipped taller tree,
+///   including empty slots.
+/// - **`depth`**: steps from that root down to `pos` (`tr - nr`).
+/// - **`bits`**: path bits within the tree (raw `marker`, not inverted).
+///
+/// Contrast [`detect_offset`], which returns `(bigger_trees, depth, !marker)`
+/// — a count of larger *populated* trees and inverted bits for MemForest.
+pub fn detect_offset_pollard(pos: u64, num_leaves: u64) -> Result<(u8, u8, u64), String> {
     let mut tr = tree_rows(num_leaves);
-    let nr = detect_row(pos, tr);
+    let nr = detect_row(pos, tr)?;
 
     let mut root_idx = tr;
     let mut marker = pos;
@@ -264,22 +324,37 @@ pub fn detect_offset_pollard(pos: u64, num_leaves: u64) -> (u8, u8, u64) {
         >= ((1_u64 << tr) & num_leaves) as u128
     {
         let tree_size = (1_u64 << tr) & num_leaves;
-        marker -= tree_size;
-        root_idx -= 1;
+        marker = marker.checked_sub(tree_size).ok_or_else(|| {
+            format!("detect_offset_pollard: marker underflow for position {pos}")
+        })?;
+        root_idx = root_idx.checked_sub(1).ok_or_else(|| {
+            format!("detect_offset_pollard: root index underflow for position {pos}")
+        })?;
+        if tr == 0 {
+            return Err(format!(
+                "detect_offset_pollard: position {pos} exceeds forest for {num_leaves} leaves"
+            ));
+        }
         tr -= 1;
     }
-    (root_idx, tr - nr, marker)
-}
 
-pub fn children(pos: u64, forest_rows: u8) -> u64 {
-    let mask = position_mask(forest_rows);
-    ((pos as u128) << 1) as u64 & mask
+    if tr < nr {
+        return Err(format!(
+            "detect_offset_pollard: row underflow for position {pos} with {num_leaves} leaves"
+        ));
+    }
+
+    Ok((root_idx, tr - nr, marker))
 }
-pub fn left_child(pos: u64, forest_rows: u8) -> u64 {
+pub fn children(pos: u64, forest_rows: u8) -> Result<u64, String> {
+    let mask = position_mask(forest_rows)?;
+    Ok(((pos as u128) << 1) as u64 & mask)
+}
+pub fn left_child(pos: u64, forest_rows: u8) -> Result<u64, String> {
     children(pos, forest_rows)
 }
-pub fn right_child(pos: u64, forest_rows: u8) -> u64 {
-    children(pos, forest_rows) + 1
+pub fn right_child(pos: u64, forest_rows: u8) -> Result<u64, String> {
+    Ok(children(pos, forest_rows)? + 1)
 }
 
 pub fn is_root_populated(row: u8, num_leaves: u64) -> bool {
@@ -291,8 +366,9 @@ pub fn max_position_at_row(row: u8, total_rows: u8, num_leaves: u64) -> Result<u
     Ok(parent_many(num_leaves, row, total_rows)?.saturating_sub(1))
 }
 // parent returns the parent position of the passed in child
-pub fn parent(pos: u64, forest_rows: u8) -> u64 {
-    (pos >> 1) | (1_u64 << forest_rows)
+pub fn parent(pos: u64, forest_rows: u8) -> Result<u64, String> {
+    check_forest_rows(forest_rows)?;
+    Ok((pos >> 1) | (1_u64 << forest_rows))
 }
 
 pub fn read_u64<Source: Read>(buf: &mut Source) -> Result<u64, io::Error> {
@@ -313,12 +389,17 @@ pub fn tree_rows(n: u64) -> u8 {
 
 // root_position returns the position of the root at a given row
 // TODO undefined behavior if the given row doesn't have a root
-pub fn root_position(num_leaves: u64, row: u8, forest_rows: u8) -> u64 {
-    let mask = position_mask(forest_rows);
+pub fn root_position(num_leaves: u64, row: u8, forest_rows: u8) -> Result<u64, String> {
+    if row > forest_rows {
+        return Err(format!(
+            "root_position: row {row} exceeds forest_rows {forest_rows}"
+        ));
+    }
+    let mask = position_mask(forest_rows)?;
     let mask_u128 = mask as u128;
     let before = (num_leaves as u128) & (mask_u128 << (row + 1));
     let shifted = (before >> row) | (mask_u128 << (forest_rows + 1 - row));
-    (shifted & mask_u128) as u64
+    Ok((shifted & mask_u128) as u64)
 }
 pub fn parent_many(pos: u64, rise: u8, forest_rows: u8) -> Result<u64, String> {
     if rise == 0 {
@@ -330,7 +411,7 @@ pub fn parent_many(pos: u64, rise: u8, forest_rows: u8) -> Result<u64, String> {
         ));
     }
 
-    let mask = position_mask(forest_rows);
+    let mask = position_mask(forest_rows)?;
     Ok((pos >> rise | (mask << (forest_rows - (rise - 1)) as u64)) & mask)
 }
 
@@ -338,8 +419,8 @@ pub fn is_ancestor(higher_pos: u64, lower_pos: u64, forest_rows: u8) -> Result<b
     if higher_pos == lower_pos {
         return Ok(false);
     }
-    let lower_row = detect_row(lower_pos, forest_rows);
-    let higher_row = detect_row(higher_pos, forest_rows);
+    let lower_row = detect_row(lower_pos, forest_rows)?;
+    let higher_row = detect_row(higher_pos, forest_rows)?;
 
     // Prevent underflows by checking that the higherRow is not less
     // than the lowerRow.
@@ -367,7 +448,8 @@ fn is_sibling(a: u64, b: u64) -> bool {
 
 /// Returns which node should have its hashes on the proof, along with all nodes
 /// whose hashes will be calculated to reach a root
-pub fn get_proof_positions(targets: &[u64], num_leaves: u64, forest_rows: u8) -> Vec<u64> {
+pub fn get_proof_positions(targets: &[u64], num_leaves: u64, forest_rows: u8) -> Result<Vec<u64>, String> {
+    check_forest_rows(forest_rows)?;
     let mut proof_positions = BTreeSet::new();
     let mut map = HashSet::with_hasher(foldhash::quality::FixedState::default());
 
@@ -384,7 +466,7 @@ pub fn get_proof_positions(targets: &[u64], num_leaves: u64, forest_rows: u8) ->
 
     while i < computed_positions.len() {
         let pos = computed_positions[i];
-        if is_root_position(pos, num_leaves, forest_rows) {
+        if is_root_position(pos, num_leaves, forest_rows)? {
             i += 1;
             continue;
         }
@@ -398,7 +480,7 @@ pub fn get_proof_positions(targets: &[u64], num_leaves: u64, forest_rows: u8) ->
             proof_positions.remove(&pos);
         }
 
-        let parent = parent(pos, forest_rows);
+        let parent = parent(pos, forest_rows)?;
         if !map.contains(&parent) {
             computed_positions.push(parent);
             map.insert(parent);
@@ -407,7 +489,7 @@ pub fn get_proof_positions(targets: &[u64], num_leaves: u64, forest_rows: u8) ->
         i += 1;
     }
 
-    proof_positions.into_iter().collect()
+    Ok(proof_positions.into_iter().collect())
 }
 
 #[cfg(test)]
@@ -443,25 +525,25 @@ mod tests {
 
         // Test that un-sorted targets results in the same result as the sorted vec.
         assert_eq!(
-            super::get_proof_positions(&unsorted, num_leaves, num_rows),
-            super::get_proof_positions(&sorted, num_leaves, num_rows)
+            super::get_proof_positions(&unsorted, num_leaves, num_rows).unwrap(),
+            super::get_proof_positions(&sorted, num_leaves, num_rows).unwrap()
         );
     }
 
     #[test]
     fn test_root_position() {
-        let pos = super::root_position(5, 2, 3);
+        let pos = super::root_position(5, 2, 3).unwrap();
         assert_eq!(pos, 12);
 
-        let pos = super::root_position(5, 0, 3);
+        let pos = super::root_position(5, 0, 3).unwrap();
         assert_eq!(pos, 4);
 
-        assert_eq!(super::root_position(5, 2, 63), 13835058055282163712);
-        assert_eq!(super::root_position(1 << 62, 0, 63), 1 << 62);
-        assert_eq!(super::root_position(1 << 62, 63, 63), u64::MAX - 1);
-        assert_eq!(super::parent(0, 63), 1 << 63);
-        assert_eq!(super::children(44, 63), 88);
-        assert_eq!(super::children(u64::MAX - 1, 63), u64::MAX - 3);
+        assert_eq!(super::root_position(5, 2, 63).unwrap(), 13835058055282163712);
+        assert_eq!(super::root_position(1 << 62, 0, 63).unwrap(), 1 << 62);
+        assert_eq!(super::root_position(1 << 62, 63, 63).unwrap(), u64::MAX - 1);
+        assert_eq!(super::parent(0, 63).unwrap(), 1 << 63);
+        assert_eq!(super::children(44, 63).unwrap(), 88);
+        assert_eq!(super::children(u64::MAX - 1, 63).unwrap(), u64::MAX - 3);
     }
 
     #[test]
@@ -477,7 +559,7 @@ mod tests {
             .map(|hash| BitcoinNodeHash::from_str(hash).unwrap())
             .collect::<Vec<_>>();
 
-        let deleted = roots_to_destroy(1, 15, &roots);
+        let deleted = roots_to_destroy(1, 15, &roots).unwrap();
 
         assert_eq!(deleted, vec![22, 28])
     }
@@ -486,15 +568,17 @@ mod tests {
     fn test_remove_bit() {
         // This should remove just one bit from the final number
         // 15 = 1111, removing bit 3 makes it 111, that is 7
-        let res = super::remove_bit(11, 2);
+        let res = super::remove_bit(11, 2).unwrap();
         assert_eq!(res, 7);
         // 1010 => 101
-        let res = super::remove_bit(10, 0);
+        let res = super::remove_bit(10, 0).unwrap();
         assert_eq!(res, 5);
 
         // 1110 => 110
-        let res = super::remove_bit(14, 1);
+        let res = super::remove_bit(14, 1).unwrap();
         assert_eq!(res, 6);
+
+        assert!(super::remove_bit(0, 64).is_err());
     }
 
     #[test]
@@ -507,11 +591,11 @@ mod tests {
         // |---\   |---\   |---\   |---\
         // 00  01  02  03  04  05  06  07
         let targets: Vec<u64> = vec![0, 1, 4, 5, 7];
-        let targets = super::detwin(targets, 3);
+        let targets = super::detwin(targets, 3).unwrap();
         assert_eq!(targets, vec![7, 8, 10]);
 
         let targets = vec![4, 6, 8, 9];
-        let targets = super::detwin(targets, 3);
+        let targets = super::detwin(targets, 3).unwrap();
         assert_eq!(targets, vec![4, 6, 12]);
     }
 
@@ -535,14 +619,14 @@ mod tests {
         for forest_rows in 1..63 {
             // Test top
             let top_pos = (2 << forest_rows) - 2;
-            let row_result = super::detect_row(top_pos, forest_rows);
+            let row_result = super::detect_row(top_pos, forest_rows).unwrap();
 
             assert_eq!(row_result, forest_rows);
 
             // Test others
             for row in 0..forest_rows {
                 let pos = row_offset(row, forest_rows);
-                let row_result = super::detect_row(pos, forest_rows);
+                let row_result = super::detect_row(pos, forest_rows).unwrap();
 
                 assert_eq!(row, row_result);
             }
@@ -550,27 +634,58 @@ mod tests {
     }
 
     #[test]
+    fn test_detect_row_invalid_forest_rows() {
+        assert!(super::detect_row(0, 64).is_err());
+    }
+
+    #[test]
+    fn test_detect_row_position_implies_invalid_row() {
+        assert!(super::detect_row(u64::MAX, 63).is_err());
+        assert!(super::is_root_position(u64::MAX, 1, 63).is_err());
+    }
+
+    #[test]
+    fn test_detect_offset_rejects_marker_underflow() {
+        assert!(super::detect_offset(3, 3).is_err());
+        assert!(super::detect_offset(u64::MAX, 8).is_err());
+        assert!(super::detect_offset_pollard(3, 3).is_err());
+        assert!(super::detect_offset_pollard(u64::MAX, 8).is_err());
+    }
+
+    #[test]
+    fn test_translate_rejects_excessive_forest_rows() {
+        assert!(super::translate(0, 64, 63).is_err());
+        assert!(super::translate(0, 63, 64).is_err());
+        assert!(super::start_position_at_row(0, 64).is_err());
+    }
+
+    #[test]
+    fn test_translate_invalid_position() {
+        assert!(super::translate(u64::MAX, 63, 3).is_err());
+    }
+
+    #[test]
     fn test_get_proof_positions() {
         let targets: Vec<u64> = vec![4, 5, 7, 8];
         let num_leaves = 8;
         let targets =
-            super::get_proof_positions(&targets, num_leaves, super::tree_rows(num_leaves));
+            super::get_proof_positions(&targets, num_leaves, super::tree_rows(num_leaves)).unwrap();
 
         assert_eq!(vec![6, 9], targets);
     }
 
     #[test]
     fn test_is_root_position() {
-        let h = super::is_root_position(14, 8, 3);
+        let h = super::is_root_position(14, 8, 3).unwrap();
         assert!(h);
     }
 
     #[test]
     fn test_children_pos() {
-        assert_eq!(children(4, 2), 0);
-        assert_eq!(children(49, 5), 34);
-        assert_eq!(children(50, 5), 36);
-        assert_eq!(children(44, 5), 24);
+        assert_eq!(children(4, 2).unwrap(), 0);
+        assert_eq!(children(49, 5).unwrap(), 34);
+        assert_eq!(children(50, 5).unwrap(), 36);
+        assert_eq!(children(44, 5).unwrap(), 24);
     }
 
     #[test]
@@ -583,15 +698,26 @@ mod tests {
     }
 
     #[test]
+    fn test_calc_next_pos_invalid() {
+        assert!(super::calc_next_pos(0, u64::MAX, 3).is_err());
+    }
+
+    #[test]
     fn test_start_position_at_row() {
-        assert_eq!(start_position_at_row(1, 12), 4096);
+        assert_eq!(start_position_at_row(1, 12).unwrap(), 4096);
 
         // Check if we don't overflow with bigger forests
-        assert_eq!(start_position_at_row(63, 63), 18446744073709551614);
-        assert_eq!(start_position_at_row(44, 63), 18446744073708503040);
+        assert_eq!(start_position_at_row(63, 63).unwrap(), 18446744073709551614);
+        assert_eq!(start_position_at_row(44, 63).unwrap(), 18446744073708503040);
 
-        assert_eq!(start_position_at_row(0, 63), 0);
-        assert_eq!(start_position_at_row(0, 32), 0);
-        assert_eq!(start_position_at_row(1, 5), 32);
+        assert_eq!(start_position_at_row(0, 63).unwrap(), 0);
+        assert_eq!(start_position_at_row(0, 32).unwrap(), 0);
+        assert_eq!(start_position_at_row(1, 5).unwrap(), 32);
+    }
+
+    #[test]
+    fn test_start_position_at_row_invalid_row() {
+        assert!(start_position_at_row(64, 63).is_err());
+        assert!(start_position_at_row(10, 5).is_err());
     }
 }

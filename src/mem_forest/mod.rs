@@ -326,7 +326,7 @@ impl<Hash: AccumulatorHash> MemForest<Hash> {
 
             positions.push(position);
         }
-        let needed = get_proof_positions(&positions, self.leaves, tree_rows(self.leaves));
+        let needed = get_proof_positions(&positions, self.leaves, tree_rows(self.leaves))?;
         let proof = needed
             .iter()
             .map(|pos| self.get_hash(*pos).unwrap())
@@ -336,7 +336,7 @@ impl<Hash: AccumulatorHash> MemForest<Hash> {
         let translated_targets = positions
             .into_iter()
             .map(|pos| translate(pos, tree_rows, MAX_FOREST_ROWS))
-            .collect();
+            .collect::<Result<Vec<_>, _>>()?;
 
         Ok(Proof::new_with_hash(translated_targets, proof))
     }
@@ -390,7 +390,7 @@ impl<Hash: AccumulatorHash> MemForest<Hash> {
         &self,
         pos: u64,
     ) -> Result<(Rc<Node<Hash>>, Rc<Node<Hash>>, Rc<Node<Hash>>), String> {
-        let (tree, branch_len, bits) = detect_offset(pos, self.leaves);
+        let (tree, branch_len, bits) = detect_offset(pos, self.leaves)?;
         let mut n = Some(self.roots[tree as usize].clone());
         let mut sibling = Some(self.roots[tree as usize].clone());
         let mut parent = sibling.clone();
@@ -506,15 +506,15 @@ impl<Hash: AccumulatorHash> MemForest<Hash> {
         let root_row = root_row.ok_or(format!(
             "Could not find the root position for row {root_idx}"
         ))?;
-        let mut pos = root_position(self.leaves, root_row, forest_rows);
+        let mut pos = root_position(self.leaves, root_row, forest_rows)?;
         for _ in 0..rows_to_top {
             // If LSB is 0, go left, otherwise go right
             match left_child_indicator & 1 {
                 0 => {
-                    pos = left_child(pos, forest_rows);
+                    pos = left_child(pos, forest_rows)?;
                 }
                 1 => {
-                    pos = right_child(pos, forest_rows);
+                    pos = right_child(pos, forest_rows)?;
                 }
                 _ => unreachable!(),
             }

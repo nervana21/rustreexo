@@ -96,6 +96,15 @@ pub struct Stump<Hash: AccumulatorHash = BitcoinNodeHash> {
     pub roots: Vec<Hash>,
 }
 
+/// Success value returned by [`Stump::add`], as `(roots, new_add, to_destroy)`.
+///
+/// - **`roots`**: The root list after all new leaves have been merged in.
+/// - **`new_add`**: Forest `(position, hash)` pairs for nodes created while
+///   merging new leaves upward.
+/// - **`to_destroy`**: Forest positions of empty placeholder roots that were
+///   overwritten by the incoming leaves.
+type RootsNewAddAndDestroy<Hash> = (Vec<Hash>, Vec<(u64, Hash)>, Vec<u64>);
+
 impl Default for Stump {
     fn default() -> Self {
         Self::new()
@@ -247,7 +256,7 @@ impl<Hash: AccumulatorHash> Stump<Hash> {
             return Err(StumpError::InvalidProof(ProofError::RootsMismatch));
         }
 
-        let (roots, updated, destroyed) = Self::add(new_roots, utxos, self.leaves);
+        let (roots, updated, destroyed) = Self::add(new_roots, utxos, self.leaves)?;
 
         let new_stump = Self {
             leaves: self.leaves + utxos.len() as u64,
@@ -329,20 +338,33 @@ impl<Hash: AccumulatorHash> Stump<Hash> {
         mut roots: Vec<Hash>,
         utxos: &[Hash],
         mut leaves: u64,
-    ) -> (Vec<Hash>, Vec<(u64, Hash)>, Vec<u64>) {
+    ) -> Result<RootsNewAddAndDestroy<Hash>, StumpError> {
         let after_rows = util::tree_rows(leaves + (utxos.len() as u64));
+        if after_rows >= 64 {
+            return Err(StumpError::InvalidProof(ProofError::InvalidTarget));
+        }
         let mut updated_subtree: BTreeSet<(u64, Hash)> = BTreeSet::new();
-        let all_deleted = util::roots_to_destroy(utxos.len() as u64, leaves, &roots);
+        let all_deleted = util::roots_to_destroy(utxos.len() as u64, leaves, &roots)
+            .map_err(|_| StumpError::InvalidProof(ProofError::InvalidTarget))?;
 
         for (i, add) in utxos.iter().enumerate() {
             let mut pos = leaves;
 
             // deleted is the empty roots that are being added over. These force
             // the current root to move up.
-            let deleted = util::roots_to_destroy((utxos.len() - i) as u64, leaves, &roots);
+            let deleted = util::roots_to_destroy((utxos.len() - i) as u64, leaves, &roots)
+                .map_err(|_| StumpError::InvalidProof(ProofError::InvalidTarget))?;
             for del in deleted {
-                if util::is_ancestor(util::parent(del, after_rows), pos, after_rows).unwrap() {
-                    pos = util::calc_next_pos(pos, del, after_rows).unwrap();
+                if util::is_ancestor(
+                    util::parent(del, after_rows)
+                        .map_err(|_| StumpError::InvalidProof(ProofError::InvalidTarget))?,
+                    pos,
+                    after_rows,
+                )
+                .map_err(|_| StumpError::InvalidProof(ProofError::InvalidTarget))?
+                {
+                    pos = util::calc_next_pos(pos, del, after_rows)
+                        .map_err(|_| StumpError::InvalidProof(ProofError::InvalidTarget))?;
                 }
             }
             let mut h = 0;
@@ -361,7 +383,8 @@ impl<Hash: AccumulatorHash> Stump<Hash> {
                     if !root.is_empty() {
                         updated_subtree.insert((util::left_sibling(pos), root));
                         updated_subtree.insert((pos, to_add));
-                        pos = util::parent(pos, after_rows);
+                        pos = util::parent(pos, after_rows)
+                            .map_err(|_| StumpError::InvalidProof(ProofError::InvalidTarget))?;
 
                         to_add = AccumulatorHash::parent_hash(&root, &to_add);
                     }
@@ -374,7 +397,7 @@ impl<Hash: AccumulatorHash> Stump<Hash> {
             roots.push(to_add);
             leaves += 1;
         }
-        (roots, updated_subtree.into_iter().collect(), all_deleted)
+        Ok((roots, updated_subtree.into_iter().collect(), all_deleted))
     }
 }
 

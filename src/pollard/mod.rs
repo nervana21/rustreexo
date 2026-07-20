@@ -653,7 +653,8 @@ impl<Hash: AccumulatorHash> Pollard<Hash> {
     pub fn prune(&mut self, positions: &[u64]) -> Result<(), PollardError<Hash>> {
         self.prune_map(positions);
 
-        let positions = detwin(positions.to_vec(), tree_rows(self.leaves));
+        let positions = detwin(positions.to_vec(), tree_rows(self.leaves))
+            .map_err(|_| PollardError::InvalidProof)?;
         for node in positions {
             let (node, _) = self
                 .grab_position(node)
@@ -693,7 +694,8 @@ impl<Hash: AccumulatorHash> Pollard<Hash> {
         }
 
         let proof_positions =
-            get_proof_positions(&target_positions, self.leaves, tree_rows(self.leaves));
+            get_proof_positions(&target_positions, self.leaves, tree_rows(self.leaves))
+                .map_err(|_| PollardError::InvalidProof)?;
         let mut proof_hashes = Vec::new();
 
         for pos in proof_positions.iter() {
@@ -710,7 +712,8 @@ impl<Hash: AccumulatorHash> Pollard<Hash> {
         let translated_targets = target_positions
             .into_iter()
             .map(|pos| translate(pos, tree_rows, MAX_FOREST_ROWS))
-            .collect();
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| PollardError::InvalidProof)?;
 
         Ok(Proof::<Hash> {
             hashes: proof_hashes,
@@ -750,7 +753,8 @@ impl<Hash: AccumulatorHash> Pollard<Hash> {
         let targets = proof.targets.clone();
         self.ingest_proof(proof, del_hashes, &targets)?;
 
-        let targets = detwin(targets, tree_rows(self.leaves));
+        let targets =
+            detwin(targets, tree_rows(self.leaves)).map_err(|_| PollardError::InvalidProof)?;
         let targets = targets
             .iter()
             .map(|x| {
@@ -884,7 +888,7 @@ impl<Hash: AccumulatorHash> Pollard<Hash> {
     }
 
     fn grab_position(&self, pos: u64) -> Option<ChildrenTuple<Hash>> {
-        let (root, depth, bits) = Self::detect_offset(pos, self.leaves);
+        let (root, depth, bits) = Self::detect_offset(pos, self.leaves).ok()?;
         let mut node = self.roots[root as usize].clone()?;
 
         if depth == 0 {
@@ -914,8 +918,10 @@ impl<Hash: AccumulatorHash> Pollard<Hash> {
     ) -> Result<(), PollardError<Hash>> {
         let forest_rows = tree_rows(self.leaves);
         while let Some((pos1, hash1)) = iter.next() {
-            if is_root_position(pos1, self.leaves, forest_rows) {
-                let root = detect_row(pos1, forest_rows);
+            if is_root_position(pos1, self.leaves, forest_rows)
+                .map_err(|_| PollardError::InvalidProof)?
+            {
+                let root = detect_row(pos1, forest_rows).map_err(|_| PollardError::InvalidProof)?;
                 self.roots[root as usize] = Some(PollardNode::new(hash1, true));
                 continue;
             }
@@ -925,7 +931,7 @@ impl<Hash: AccumulatorHash> Pollard<Hash> {
                 return Err(PollardError::InvalidProof);
             }
 
-            let aunt = parent(pos1, forest_rows);
+            let aunt = parent(pos1, forest_rows).map_err(|_| PollardError::InvalidProof)?;
             let aunt = self
                 .grab_position(aunt)
                 .ok_or(PollardError::AuntNotFound)?
@@ -964,7 +970,8 @@ impl<Hash: AccumulatorHash> Pollard<Hash> {
             .calculate_hashes(del_hashes, self.leaves)
             .map_err(|_| PollardError::InvalidProof)?;
 
-        let proof_positions = get_proof_positions(&proof.targets, self.leaves, forest_rows);
+        let proof_positions = get_proof_positions(&proof.targets, self.leaves, forest_rows)
+            .map_err(|_| PollardError::InvalidProof)?;
 
         all_nodes.extend(proof_positions.into_iter().zip(proof.hashes.clone()));
         all_nodes.sort();
@@ -989,8 +996,8 @@ impl<Hash: AccumulatorHash> Pollard<Hash> {
         Ok(())
     }
 
-    fn detect_offset(pos: u64, num_leaves: u64) -> (u8, u8, u64) {
-        detect_offset_pollard(pos, num_leaves)
+    fn detect_offset(pos: u64, num_leaves: u64) -> Result<(u8, u8, u64), PollardError<Hash>> {
+        detect_offset_pollard(pos, num_leaves).map_err(|_| PollardError::InvalidProof)
     }
 
     fn get_hash(&self, pos: u64) -> Result<Hash, PollardError<Hash>> {
@@ -1098,7 +1105,8 @@ impl<Hash: AccumulatorHash> Pollard<Hash> {
 
         while self.leaves >> row & 1 == 1 {
             let old_root = mem::take(&mut self.roots[row as usize]).expect("Root not found");
-            let pos = root_position(self.leaves(), row, tree_rows(self.leaves()));
+            let pos = root_position(self.leaves(), row, tree_rows(self.leaves()))
+                .map_err(|_| PollardError::InvalidProof)?;
 
             add_positions.push((pos, old_root.hash()));
 
@@ -1239,15 +1247,16 @@ impl<Hash: AccumulatorHash> Pollard<Hash> {
         let forest_rows = tree_rows(self.leaves);
         let root_row = root_row.ok_or(PollardError::RootNotFound)?;
 
-        let mut pos = root_position(self.leaves, root_row as u8, forest_rows);
+        let mut pos = root_position(self.leaves, root_row as u8, forest_rows)
+            .map_err(|_| PollardError::InvalidProof)?;
         for _ in 0..rows_to_top {
             // If LSB is 0, go left, otherwise go right
             match left_child_indicator & 1 {
                 0 => {
-                    pos = left_child(pos, forest_rows);
+                    pos = left_child(pos, forest_rows).map_err(|_| PollardError::InvalidProof)?;
                 }
                 1 => {
-                    pos = right_child(pos, forest_rows);
+                    pos = right_child(pos, forest_rows).map_err(|_| PollardError::InvalidProof)?;
                 }
                 _ => unreachable!(),
             }
@@ -1680,6 +1689,12 @@ mod tests {
                 }
             })
             .collect()
+    }
+
+    #[test]
+    fn test_detect_offset_rejects_out_of_range_position() {
+        let res = Pollard::<BitcoinNodeHash>::detect_offset(3, 3);
+        assert!(matches!(res, Err(PollardError::InvalidProof)));
     }
 
     #[test]
