@@ -667,8 +667,11 @@ impl<Hash: AccumulatorHash> Pollard<Hash> {
     pub fn prune(&mut self, positions: &[u64]) -> Result<(), PollardError<Hash>> {
         self.prune_map(positions);
 
-        let positions = detwin(positions.to_vec(), tree_rows(self.leaves))
-            .map_err(|_| PollardError::InvalidPosition)?;
+        let positions = detwin(
+            positions.to_vec(),
+            tree_rows(self.leaves).map_err(|_| PollardError::InvalidPosition)?,
+        )
+        .map_err(|_| PollardError::InvalidPosition)?;
         for node in positions {
             let (node, _) = self
                 .grab_position(node)
@@ -708,7 +711,7 @@ impl<Hash: AccumulatorHash> Pollard<Hash> {
         }
 
         let proof_positions =
-            get_proof_positions(&target_positions, self.leaves, tree_rows(self.leaves))
+            get_proof_positions(&target_positions, self.leaves, tree_rows(self.leaves).map_err(|_| PollardError::InvalidPosition)?)
                 .map_err(|_| PollardError::InvalidPosition)?;
         let mut proof_hashes = Vec::new();
 
@@ -722,7 +725,7 @@ impl<Hash: AccumulatorHash> Pollard<Hash> {
             proof_hashes.push(hash);
         }
 
-        let tree_rows = tree_rows(self.leaves);
+        let tree_rows = tree_rows(self.leaves).map_err(|_| PollardError::InvalidPosition)?;
         let translated_targets = target_positions
             .into_iter()
             .map(|pos| translate(pos, tree_rows, MAX_FOREST_ROWS))
@@ -768,7 +771,7 @@ impl<Hash: AccumulatorHash> Pollard<Hash> {
         self.ingest_proof(proof, del_hashes, &targets)?;
 
         let targets =
-            detwin(targets, tree_rows(self.leaves)).map_err(|_| PollardError::InvalidPosition)?;
+            detwin(targets, tree_rows(self.leaves).map_err(|_| PollardError::InvalidPosition)?).map_err(|_| PollardError::InvalidPosition)?;
         let targets = targets
             .iter()
             .map(|x| {
@@ -866,6 +869,8 @@ impl<Hash: AccumulatorHash> Pollard<Hash> {
         reader.read_exact(&mut leaves)?;
         let leaves = u64::from_be_bytes(leaves);
 
+        tree_rows(leaves).map_err(|_| PollardError::InvalidPosition)?;
+
         let mut pollard = Self::new();
         pollard.leaves = leaves;
 
@@ -930,7 +935,7 @@ impl<Hash: AccumulatorHash> Pollard<Hash> {
         mut iter: impl Iterator<Item = (u64, Hash)>,
         remembers: &[u64],
     ) -> Result<(), PollardError<Hash>> {
-        let forest_rows = tree_rows(self.leaves);
+        let forest_rows = tree_rows(self.leaves).map_err(|_| PollardError::InvalidPosition)?;
         while let Some((pos1, hash1)) = iter.next() {
             if is_root_position(pos1, self.leaves, forest_rows)
                 .map_err(|_| PollardError::InvalidPosition)?
@@ -979,7 +984,7 @@ impl<Hash: AccumulatorHash> Pollard<Hash> {
         remembers: &[u64],
         recompute: bool,
     ) -> Result<(), PollardError<Hash>> {
-        let forest_rows = tree_rows(self.leaves);
+        let forest_rows = tree_rows(self.leaves).map_err(|_| PollardError::InvalidPosition)?;
         let (mut all_nodes, _) = proof
             .calculate_hashes(del_hashes, self.leaves)
             .map_err(PollardError::from)?;
@@ -1026,7 +1031,10 @@ impl<Hash: AccumulatorHash> Pollard<Hash> {
         if self.leaves == 0 {
             return "empty".to_owned();
         }
-        let fh = tree_rows(self.leaves);
+        let fh = match tree_rows(self.leaves) {
+            Ok(rows) => rows,
+            Err(_) => return format!("invalid leaf count {}", self.leaves),
+        };
         // The accumulator should be less than 6 rows.
         if fh > 6 {
             let s = format!("Can't print {} leaves. roots: \n", self.leaves);
@@ -1110,6 +1118,12 @@ impl<Hash: AccumulatorHash> Pollard<Hash> {
         &mut self,
         node: PollardAddition<Hash>,
     ) -> Result<AddSingleResult<Hash>, PollardError<Hash>> {
+        let next_leaves = self
+            .leaves
+            .checked_add(1)
+            .ok_or(PollardError::InvalidPosition)?;
+        tree_rows(next_leaves).map_err(|_| PollardError::InvalidPosition)?;
+
         let mut row = 0;
         let mut new_node = PollardNode::new(node.hash, node.remember);
         self.leaf_map.insert(node.hash, Rc::downgrade(&new_node));
@@ -1119,8 +1133,12 @@ impl<Hash: AccumulatorHash> Pollard<Hash> {
 
         while self.leaves >> row & 1 == 1 {
             let old_root = mem::take(&mut self.roots[row as usize]).expect("Root not found");
-            let pos = root_position(self.leaves(), row, tree_rows(self.leaves()))
-                .map_err(|_| PollardError::InvalidPosition)?;
+            let pos = root_position(
+                self.leaves(),
+                row,
+                tree_rows(self.leaves()).map_err(|_| PollardError::InvalidPosition)?,
+            )
+            .map_err(|_| PollardError::InvalidPosition)?;
 
             add_positions.push((pos, old_root.hash()));
 
@@ -1180,7 +1198,7 @@ impl<Hash: AccumulatorHash> Pollard<Hash> {
         }
 
         self.roots[row as usize] = Some(new_node);
-        self.leaves += 1;
+        self.leaves = next_leaves;
 
         Ok((add_positions, roots_to_destroy))
     }
@@ -1258,7 +1276,7 @@ impl<Hash: AccumulatorHash> Pollard<Hash> {
             false
         });
 
-        let forest_rows = tree_rows(self.leaves);
+        let forest_rows = tree_rows(self.leaves).map_err(|_| PollardError::InvalidPosition)?;
         let root_row = root_row.ok_or(PollardError::RootNotFound)?;
 
         let mut pos = root_position(self.leaves, root_row as u8, forest_rows)
@@ -1709,6 +1727,19 @@ mod tests {
     fn test_detect_offset_rejects_out_of_range_position() {
         let res = Pollard::<BitcoinNodeHash>::detect_offset(3, 3);
         assert!(matches!(res, Err(PollardError::InvalidPosition)));
+    }
+
+    #[test]
+    fn test_add_rejects_excessive_leaf_count() {
+        let mut p = Pollard::<BitcoinNodeHash>::new();
+        p.leaves = 1 << 63;
+        let add = PollardAddition {
+            hash: BitcoinNodeHash::from([1; 32]),
+            remember: true,
+        };
+        let res = p.add_single(add);
+        assert!(matches!(res, Err(PollardError::InvalidPosition)));
+        assert_eq!(p.leaves, 1 << 63);
     }
 
     #[test]

@@ -259,7 +259,10 @@ impl<Hash: AccumulatorHash> Stump<Hash> {
         let (roots, updated, destroyed) = Self::add(new_roots, utxos, self.leaves)?;
 
         let new_stump = Self {
-            leaves: self.leaves + utxos.len() as u64,
+            leaves: self
+                .leaves
+                .checked_add(utxos.len() as u64)
+                .ok_or(StumpError::InvalidProof(ProofError::InvalidPosition))?,
             roots,
         };
 
@@ -300,6 +303,8 @@ impl<Hash: AccumulatorHash> Stump<Hash> {
     /// ```
     pub fn deserialize<Source: Read>(mut data: Source) -> Result<Self, StumpError> {
         let leaves = util::read_u64(&mut data)?;
+        util::tree_rows(leaves)
+            .map_err(|_| StumpError::InvalidProof(ProofError::InvalidPosition))?;
         let roots_len = util::read_u64(&mut data)?;
         let mut roots = vec![];
 
@@ -339,10 +344,11 @@ impl<Hash: AccumulatorHash> Stump<Hash> {
         utxos: &[Hash],
         mut leaves: u64,
     ) -> Result<RootsNewAddAndDestroy<Hash>, StumpError> {
-        let after_rows = util::tree_rows(leaves + (utxos.len() as u64));
-        if after_rows >= 64 {
-            return Err(StumpError::InvalidProof(ProofError::InvalidPosition));
-        }
+        let after_leaves = leaves
+            .checked_add(utxos.len() as u64)
+            .ok_or(StumpError::InvalidProof(ProofError::InvalidPosition))?;
+        let after_rows = util::tree_rows(after_leaves)
+            .map_err(|_| StumpError::InvalidProof(ProofError::InvalidPosition))?;
         let mut updated_subtree: BTreeSet<(u64, Hash)> = BTreeSet::new();
         let all_deleted = util::roots_to_destroy(utxos.len() as u64, leaves, &roots)
             .map_err(|_| StumpError::InvalidProof(ProofError::InvalidPosition))?;
@@ -395,7 +401,9 @@ impl<Hash: AccumulatorHash> Stump<Hash> {
             updated_subtree.insert((pos, to_add));
 
             roots.push(to_add);
-            leaves += 1;
+            leaves = leaves
+                .checked_add(1)
+                .ok_or(StumpError::InvalidProof(ProofError::InvalidPosition))?;
         }
         Ok((roots, updated_subtree.into_iter().collect(), all_deleted))
     }
@@ -735,6 +743,36 @@ mod test {
         let mut reader = Cursor::new(writer);
         let stump2 = Stump::deserialize(&mut reader).unwrap();
         assert_eq!(stump, stump2);
+    }
+
+    #[test]
+    fn test_deserialize_rejects_excessive_leaves() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&((1u64 << 63) + 1).to_le_bytes());
+        buf.extend_from_slice(&0u64.to_le_bytes());
+        let res = Stump::<BitcoinNodeHash>::deserialize(Cursor::new(buf));
+        assert!(matches!(
+            res,
+            Err(StumpError::InvalidProof(ProofError::InvalidPosition))
+        ));
+    }
+
+    #[test]
+    fn test_modify_rejects_leaf_count_overflow() {
+        let stump = Stump {
+            leaves: u64::MAX - 1,
+            roots: vec![],
+        };
+        let hashes = [
+            BitcoinNodeHash::from([1; 32]),
+            BitcoinNodeHash::from([2; 32]),
+            BitcoinNodeHash::from([3; 32]),
+        ];
+        let res = stump.modify(&hashes, &[], &Proof::default());
+        assert!(matches!(
+            res,
+            Err(StumpError::InvalidProof(ProofError::InvalidPosition))
+        ));
     }
 
     #[test]

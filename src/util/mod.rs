@@ -197,19 +197,30 @@ pub fn roots_to_destroy<Hash: AccumulatorHash>(
     let mut h = 0;
     for add in 0..num_adds {
         while (num_leaves >> h) & 1 == 1 {
-            let root = roots
-                .pop()
-                .expect("If (num_leaves >> h) & 1 == 1, it must have at least one root left");
+            let root = roots.pop().ok_or_else(|| {
+                format!(
+                    "roots_to_destroy: missing root at height {h} for {num_leaves} leaves"
+                )
+            })?;
             if root.is_empty() {
-                let root_pos =
-                    root_position(num_leaves, h, tree_rows(num_leaves + (num_adds - add)))?;
+                let next_leaves = num_leaves
+                    .checked_add(num_adds - add)
+                    .ok_or_else(|| {
+                        format!(
+                            "roots_to_destroy: leaf count overflow at {num_leaves} + {}",
+                            num_adds - add
+                        )
+                    })?;
+                let root_pos = root_position(num_leaves, h, tree_rows(next_leaves)?)?;
                 deleted.push(root_pos);
             }
             h += 1;
         }
         // Just adding a non-zero value to the slice.
         roots.push(AccumulatorHash::placeholder());
-        num_leaves += 1;
+        num_leaves = num_leaves
+            .checked_add(1)
+            .ok_or_else(|| "roots_to_destroy: leaf count overflow".to_string())?;
     }
 
     Ok(deleted)
@@ -240,7 +251,7 @@ pub fn detect_row(pos: u64, forest_rows: u8) -> Result<u8, String> {
 }
 
 pub fn detect_offset(pos: u64, num_leaves: u64) -> Result<(u8, u8, u64), String> {
-    let mut tr = tree_rows(num_leaves);
+    let mut tr = tree_rows(num_leaves)?;
     let nr = detect_row(pos, tr)?;
 
     let mut bigger_trees: u8 = 0;
@@ -314,7 +325,7 @@ pub fn detect_offset(pos: u64, num_leaves: u64) -> Result<(u8, u8, u64), String>
 /// Contrast [`detect_offset`], which returns `(bigger_trees, depth, !marker)`
 /// — a count of larger *populated* trees and inverted bits for MemForest.
 pub fn detect_offset_pollard(pos: u64, num_leaves: u64) -> Result<(u8, u8, u64), String> {
-    let mut tr = tree_rows(num_leaves);
+    let mut tr = tree_rows(num_leaves)?;
     let nr = detect_row(pos, tr)?;
 
     let mut root_idx = tr;
@@ -377,14 +388,17 @@ pub fn read_u64<Source: Read>(buf: &mut Source) -> Result<u64, io::Error> {
     Ok(u64::from_le_bytes(bytes))
 }
 
-// tree_rows returns the number of rows given n leaves
-pub fn tree_rows(n: u64) -> u8 {
+// tree_rows returns the number of rows given n leaves.
+// Rejects values that would need 64+ rows (beyond u64 position width / MAX_FOREST_ROWS).
+pub fn tree_rows(n: u64) -> Result<u8, String> {
     if n == 0 {
-        return 0;
+        return Ok(0);
     }
     // 64 is the number of bits in an u64. We can't use use u64::BITS, because this
     // was added on 1.53, and our MSRV is 1.41
-    (64 - (n - 1).leading_zeros()) as u8
+    let rows = (64 - (n - 1).leading_zeros()) as u8;
+    check_forest_rows(rows)?;
+    Ok(rows)
 }
 
 // root_position returns the position of the root at a given row
@@ -521,7 +535,7 @@ mod tests {
         let unsorted = vec![33, 35, 32, 34, 50, 52];
         let sorted = vec![33, 35, 32, 34, 50, 52];
         let num_leaves = 32_u64;
-        let num_rows = tree_rows(num_leaves);
+        let num_rows = tree_rows(num_leaves).unwrap();
 
         // Test that un-sorted targets results in the same result as the sorted vec.
         assert_eq!(
@@ -565,6 +579,13 @@ mod tests {
     }
 
     #[test]
+    fn test_roots_to_destroy_missing_root() {
+        // One empty root enters the destroy path; leaf popcount still needs more pops → err.
+        let roots = vec![BitcoinNodeHash::Empty];
+        assert!(roots_to_destroy(1, 15, &roots).is_err());
+    }
+
+    #[test]
     fn test_remove_bit() {
         // This should remove just one bit from the final number
         // 15 = 1111, removing bit 3 makes it 111, that is 7
@@ -601,10 +622,12 @@ mod tests {
 
     #[test]
     fn test_tree_rows() {
-        assert_eq!(super::tree_rows(8), 3);
-        assert_eq!(super::tree_rows(9), 4);
-        assert_eq!(super::tree_rows(12), 4);
-        assert_eq!(super::tree_rows(255), 8);
+        assert_eq!(super::tree_rows(8).unwrap(), 3);
+        assert_eq!(super::tree_rows(9).unwrap(), 4);
+        assert_eq!(super::tree_rows(12).unwrap(), 4);
+        assert_eq!(super::tree_rows(255).unwrap(), 8);
+        assert!(super::tree_rows((1 << 63) + 1).is_err());
+        assert!(super::tree_rows(u64::MAX).is_err());
     }
 
     fn row_offset(row: u8, forest_rows: u8) -> u64 {
@@ -669,7 +692,7 @@ mod tests {
         let targets: Vec<u64> = vec![4, 5, 7, 8];
         let num_leaves = 8;
         let targets =
-            super::get_proof_positions(&targets, num_leaves, super::tree_rows(num_leaves)).unwrap();
+            super::get_proof_positions(&targets, num_leaves, super::tree_rows(num_leaves).unwrap()).unwrap();
 
         assert_eq!(vec![6, 9], targets);
     }
