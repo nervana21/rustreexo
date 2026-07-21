@@ -793,11 +793,25 @@ impl<Hash: AccumulatorHash> Pollard<Hash> {
         del_hashes: &[Hash],
         proof: Proof<Hash>,
     ) -> Result<(), PollardError<Hash>> {
-        let targets = proof.targets.clone();
-        self.ingest_proof(proof, del_hashes, &targets)?;
+        let forest_rows = tree_rows(self.leaves).map_err(|_| PollardError::InvalidPosition)?;
+        // Proof targets use wire coordinates (a forest with MAX_FOREST_ROWS
+        // rows), matching what `batch_proof` emits. Map them into this
+        // Pollard's live row count before touching positions: after a delete a
+        // survivor can be promoted off row 0, so wire and local coordinates
+        // diverge and the raw wire target no longer exists in this forest.
+        let wire_targets = proof.targets.clone();
+        let local_targets = wire_targets
+            .iter()
+            .map(|pos| {
+                translate(*pos, MAX_FOREST_ROWS, forest_rows)
+                    .map_err(|_| PollardError::InvalidPosition)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
 
-        let targets =
-            detwin(targets, tree_rows(self.leaves).map_err(|_| PollardError::InvalidPosition)?).map_err(|_| PollardError::InvalidPosition)?;
+        self.ingest_proof(proof, del_hashes, &wire_targets)?;
+
+        let targets = detwin(local_targets, forest_rows)
+            .map_err(|_| PollardError::InvalidPosition)?;
         let targets = targets
             .iter()
             .map(|x| {
@@ -1034,19 +1048,38 @@ impl<Hash: AccumulatorHash> Pollard<Hash> {
             .calculate_hashes(del_hashes, self.leaves)
             .map_err(PollardError::from)?;
 
-        let proof_positions = get_proof_positions(&proof.targets, self.leaves, forest_rows)
+        // `proof.targets` and `remembers` use wire coordinates
+        // (MAX_FOREST_ROWS rows), while `calculate_hashes` already yields nodes
+        // in this Pollard's local coordinates. Translate both so proof-position,
+        // remember, and prune math agree with those nodes.
+        let translate_local = |pos: u64| {
+            translate(pos, MAX_FOREST_ROWS, forest_rows)
+                .map_err(|_| PollardError::InvalidPosition)
+        };
+        let local_targets = proof
+            .targets
+            .iter()
+            .map(|pos| translate_local(*pos))
+            .collect::<Result<Vec<_>, _>>()?;
+        let local_remembers = remembers
+            .iter()
+            .map(|pos| translate_local(*pos))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let proof_positions = get_proof_positions(&local_targets, self.leaves, forest_rows)
             .map_err(|_| PollardError::InvalidPosition)?;
 
         all_nodes.extend(proof_positions.into_iter().zip(proof.hashes.clone()));
         all_nodes.sort();
         let iter = all_nodes.into_iter().rev();
-        self.ingest_positions(iter, remembers)?;
+        self.ingest_positions(iter, &local_remembers)?;
 
         let pruned = proof
             .targets
             .iter()
-            .filter(|x| !remembers.contains(x))
-            .copied()
+            .zip(local_targets.iter())
+            .filter(|(wire, _)| !remembers.contains(wire))
+            .map(|(_, local)| *local)
             .collect::<Vec<_>>();
 
         self.prune(&pruned)?;
@@ -1696,6 +1729,60 @@ mod tests {
             Ok(true),
             "pollard must accept mem proof despite ascending roots()"
         );
+    }
+
+    /// After deleting one of two leaves the survivor is promoted off row 0.
+    /// A follow-up delete must translate the wire-coordinate proof target into
+    /// this Pollard's live row count; otherwise `modify` rejects the promoted
+    /// leaf with `InvalidPosition`. Regression for the accumulator_crosscheck
+    /// fuzz crash.
+    #[test]
+    fn test_modify_delete_promoted_leaf() {
+        use crate::mem_forest::MemForest;
+
+        let a = hash_from_u8(1);
+        let b = hash_from_u8(2);
+
+        let mut mem = MemForest::<BitcoinNodeHash>::new();
+        let mut pollard = Pollard::<BitcoinNodeHash>::new();
+
+        mem.modify(&[a, b], &[]).unwrap();
+        pollard
+            .modify(
+                &[
+                    PollardAddition {
+                        hash: a,
+                        remember: true,
+                    },
+                    PollardAddition {
+                        hash: b,
+                        remember: true,
+                    },
+                ],
+                &[],
+                Proof::default(),
+            )
+            .unwrap();
+
+        // Delete `a`; `b` is promoted to a root at a non-row-0 position.
+        let proof = mem.prove(&[a]).unwrap();
+        mem.modify(&[], &[a]).unwrap();
+        pollard.modify(&[], &[a], proof).unwrap();
+
+        // Deleting the promoted survivor must succeed, not return
+        // `InvalidPosition` from the wire/local coordinate mismatch.
+        let proof = mem.prove(&[b]).unwrap();
+        mem.modify(&[], &[b]).unwrap();
+        pollard
+            .modify(&[], &[b], proof)
+            .expect("delete promoted leaf");
+
+        let mem_roots = mem
+            .get_roots()
+            .iter()
+            .map(|root| root.get_data())
+            .collect::<Vec<_>>();
+        assert_eq!(pollard.roots(), mem_roots);
     }
 
     #[test]
