@@ -386,7 +386,7 @@ impl<Hash: AccumulatorHash> MemForest<Hash> {
     /// ```
     pub fn modify(&mut self, add: &[Hash], del: &[Hash]) -> Result<(), String> {
         self.del(del)?;
-        self.add(add);
+        self.add(add)?;
         Ok(())
     }
 
@@ -443,8 +443,11 @@ impl<Hash: AccumulatorHash> MemForest<Hash> {
 
         for (_, target) in nodes {
             match self.map.remove(&target) {
-                Some(target) => {
-                    self.del_single(&target.upgrade().unwrap());
+                Some(weak) => {
+                    let node = weak
+                        .upgrade()
+                        .ok_or_else(|| format!("node {target} vanished during delete"))?;
+                    self.del_single(&node)?;
                 }
                 None => {
                     return Err(format!("node {target} not in the forest"));
@@ -529,56 +532,87 @@ impl<Hash: AccumulatorHash> MemForest<Hash> {
         Ok(pos)
     }
 
-    fn del_single(&mut self, node: &Node<Hash>) -> Option<()> {
-        let parent = node.parent.borrow();
-        // Deleting a root
-        let parent = match *parent {
-            Some(ref node) => node.upgrade()?,
-            None => {
-                let pos = self.roots.iter().position(|x| x.data == node.data).unwrap();
-                self.roots[pos] = Rc::new(Node {
-                    ty: NodeType::Branch,
-                    parent: RefCell::new(None),
-                    data: Cell::new(Hash::empty()),
-                    left: RefCell::new(None),
-                    right: RefCell::new(None),
-                });
-                return None;
-            }
-        };
-
-        let me = parent.left.borrow();
-        // Can unwrap because we know the sibling exists
-        let sibling = if me.as_deref()?.data == node.data {
-            parent.right.borrow().clone()
-        } else {
-            parent.left.borrow().clone()
-        };
-        if let Some(ref sibling) = sibling {
-            let grandparent = parent.parent.borrow().clone();
-            sibling.parent.replace(grandparent.clone());
-
-            if let Some(ref grandparent) = grandparent.and_then(|g| g.upgrade()) {
-                if grandparent.left.borrow().clone().as_ref().unwrap().data == parent.data {
-                    grandparent.left.replace(Some(sibling.clone()));
-                } else {
-                    grandparent.right.replace(Some(sibling.clone()));
+    fn del_single(&mut self, node: &Node<Hash>) -> Result<(), String> {
+        // Drop the borrow of `node.parent` before any later `replace` on a
+        // child's parent slot. Sibling detection must use pointer identity:
+        // duplicate leaf hashes would make hash equality treat the target as
+        // its own sibling and `replace` the still-borrowed parent RefCell.
+        let parent = {
+            let parent_slot = node.parent.borrow();
+            match *parent_slot {
+                Some(ref parent) => parent.upgrade().ok_or_else(|| {
+                    "del_single: could not upgrade parent".to_string()
+                })?,
+                None => {
+                    drop(parent_slot);
+                    let pos = self
+                        .roots
+                        .iter()
+                        .position(|x| core::ptr::eq(x.as_ref(), node))
+                        .ok_or_else(|| "del_single: root not found".to_string())?;
+                    self.roots[pos] = Rc::new(Node {
+                        ty: NodeType::Branch,
+                        parent: RefCell::new(None),
+                        data: Cell::new(Hash::empty()),
+                        left: RefCell::new(None),
+                        right: RefCell::new(None),
+                    });
+                    return Ok(());
                 }
-                sibling.recompute_hashes();
-            } else {
-                let pos = self
-                    .roots
-                    .iter()
-                    .position(|x| x.data == parent.data)
-                    .unwrap();
-                self.roots[pos] = sibling.clone();
             }
         };
 
-        Some(())
+        let sibling = {
+            let left = parent.left.borrow();
+            let right = parent.right.borrow();
+            if left
+                .as_ref()
+                .is_some_and(|left| core::ptr::eq(left.as_ref(), node))
+            {
+                right.clone()
+            } else if right
+                .as_ref()
+                .is_some_and(|right| core::ptr::eq(right.as_ref(), node))
+            {
+                left.clone()
+            } else {
+                return Err("del_single: node is not a child of its parent".to_string());
+            }
+        }
+        .ok_or_else(|| "del_single: missing sibling".to_string())?;
+
+        let grandparent = parent.parent.borrow().clone();
+        sibling.parent.replace(grandparent.clone());
+
+        if let Some(ref grandparent) = grandparent.and_then(|g| g.upgrade()) {
+            let parent_is_left = grandparent
+                .left
+                .borrow()
+                .as_ref()
+                .is_some_and(|left| Rc::ptr_eq(left, &parent));
+            if parent_is_left {
+                grandparent.left.replace(Some(sibling.clone()));
+            } else {
+                grandparent.right.replace(Some(sibling.clone()));
+            }
+            sibling.recompute_hashes();
+        } else {
+            let pos = self
+                .roots
+                .iter()
+                .position(|x| Rc::ptr_eq(x, &parent))
+                .ok_or_else(|| "del_single: parent root not found".to_string())?;
+            self.roots[pos] = sibling.clone();
+        }
+
+        Ok(())
     }
 
-    fn add_single(&mut self, value: Hash) {
+    fn add_single(&mut self, value: Hash) -> Result<(), String> {
+        if self.map.contains_key(&value) {
+            return Err(format!("add_single: duplicate leaf hash {value}"));
+        }
+
         let mut node: Rc<Node<Hash>> = Rc::new(Node {
             ty: NodeType::Leaf,
             parent: RefCell::new(None),
@@ -612,12 +646,22 @@ impl<Hash: AccumulatorHash> MemForest<Hash> {
         }
         self.roots.push(node);
         self.leaves += 1;
+        Ok(())
     }
 
-    fn add(&mut self, values: &[Hash]) {
-        for value in values {
-            self.add_single(*value);
+    fn add(&mut self, values: &[Hash]) -> Result<(), String> {
+        for (i, value) in values.iter().enumerate() {
+            if self.map.contains_key(value) {
+                return Err(format!("add: duplicate leaf hash {value}"));
+            }
+            if values[..i].contains(value) {
+                return Err(format!("add: duplicate leaf hash {value} in batch"));
+            }
         }
+        for value in values {
+            self.add_single(*value)?;
+        }
+        Ok(())
     }
 
     /// to_string returns the full MemForest in a string for all forests less than 6 rows.
@@ -778,7 +822,7 @@ mod test {
         let hashes = values.into_iter().map(hash_from_u8).collect::<Vec<_>>();
 
         let mut acc = MemForest::new();
-        acc.add(&hashes);
+        acc.add(&hashes).expect("add unique leaves");
 
         assert_eq!(
             "b151a956139bb821d4effa34ea95c17560e0135d1e4661fc23cedc3af49dac42",
@@ -811,7 +855,8 @@ mod test {
 
         let mut p = MemForest::new();
         p.modify(&hashes, &[]).expect("MemForest should not fail");
-        p.del_single(&p.grab_node(1).unwrap().0);
+        p.del_single(&p.grab_node(1).unwrap().0)
+            .expect("del_single right child");
         assert_eq!(p.get_roots().len(), 1);
 
         let root = p.get_roots()[0].clone();
@@ -832,7 +877,8 @@ mod test {
 
         let mut p = MemForest::new();
         p.modify(&hashes, &[]).expect("MemForest should not fail");
-        p.del_single(&p.grab_node(2).unwrap().0);
+        p.del_single(&p.grab_node(2).unwrap().0)
+            .expect("del_single root");
         assert_eq!(p.get_roots().len(), 1);
         let root = p.get_roots()[0].clone();
         assert_eq!(root.data.get(), BitcoinNodeHash::default());
@@ -871,6 +917,36 @@ mod test {
         assert_eq!(node.data.get(), hashes[0]);
     }
 
+    /// Duplicate leaf hashes overwrite the map entry and used to panic in
+    /// `del_single` (fuzz `accumulator_crosscheck` crash-9f1b1d…). Reject them
+    /// at add time; pointer-identity delete remains as defense in depth.
+    #[test]
+    fn test_reject_duplicate_leaf_hash() {
+        let h = BitcoinNodeHash::from([1u8; 32]);
+        let mut p = MemForest::new();
+        assert!(p.modify(&[h, h], &[]).is_err());
+        assert_eq!(p.get_roots().len(), 0);
+
+        p.modify(&[h], &[]).expect("first insert ok");
+        assert!(p.modify(&[h], &[]).is_err());
+        assert_eq!(p.get_roots().len(), 1);
+        assert_eq!(p.get_roots()[0].get_data(), h);
+    }
+
+    /// Delete the right child under a root parent (pointer sibling path).
+    #[test]
+    fn test_delete_right_child_promotes_left() {
+        let left = BitcoinNodeHash::from([1u8; 32]);
+        let right = BitcoinNodeHash::from([2u8; 32]);
+        let mut p = MemForest::new();
+        p.modify(&[left, right], &[]).expect("add two leaves");
+        p.modify(&[], &[right]).expect("delete right child");
+        assert_eq!(p.get_roots().len(), 1);
+        assert_eq!(p.get_roots()[0].get_data(), left);
+        assert!(p.prove(&[left]).is_ok());
+        assert!(p.prove(&[right]).is_err());
+    }
+
     #[derive(Debug, Deserialize)]
     struct TestCase {
         leaf_preimages: Vec<u8>,
@@ -884,6 +960,14 @@ mod test {
             .iter()
             .map(|preimage| hash_from_u8(*preimage))
             .collect::<Vec<_>>();
+        // MemForest indexes leaves by hash; shared JSON cases may repeat
+        // preimages (valid for Stump). Skip those here.
+        let mut unique = hashes.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        if unique.len() != hashes.len() {
+            return;
+        }
         let mut p = MemForest::new();
         p.modify(&hashes, &[]).expect("Test mem_forests are valid");
         assert_eq!(p.get_roots().len(), case.expected_roots.len());
