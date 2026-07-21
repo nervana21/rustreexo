@@ -1113,4 +1113,29 @@ mod test {
         assert!(res.is_err());
         assert_eq!(res.unwrap_err().kind(), io::ErrorKind::InvalidData);
     }
+
+    /// After deleting one of two leaves, the survivor sits at a non-row-0
+    /// position. Verify must use translated (local) targets, not wire coords.
+    #[test]
+    fn test_verify_promoted_leaf_after_sibling_delete() {
+        use crate::stump::Stump;
+
+        let a = BitcoinNodeHash::from([33; 32]);
+        let b = BitcoinNodeHash::from([12; 32]);
+        let mut mem = MemForest::<BitcoinNodeHash>::new();
+        let mut stump = Stump::<BitcoinNodeHash>::new();
+
+        mem.modify(&[a, b], &[]).unwrap();
+        stump = stump.modify(&[a, b], &[], &Proof::default()).unwrap().0;
+
+        let del_proof = mem.prove(&[a]).unwrap();
+        assert_eq!(stump.verify(&del_proof, &[a]), Ok(true));
+        mem.modify(&[], &[a]).unwrap();
+        stump = stump.modify(&[], &[a], &del_proof).unwrap().0;
+
+        let proof = mem.prove(&[b]).expect("prove promoted leaf");
+        assert_eq!(mem.verify(&proof, &[b]), Ok(true));
+        assert_eq!(stump.verify(&proof, &[b]), Ok(true));
+    }
+
 }
