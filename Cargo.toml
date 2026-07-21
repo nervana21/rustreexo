@@ -16,6 +16,8 @@ autobenches = false
 default = ["std"]
 std = ["bitcoin_hashes/std", "hex-conservative/std", "hashbrown/default-hasher"]
 with-serde = ["serde"]
+# Internal: expose crate-private position helpers to the fuzz package only.
+fuzzing = []
 
 [dependencies]
 bitcoin_hashes = { version = "0.20", default-features = false }
@@ -73,7 +75,7 @@ sample_strategy = "all"
 
 # Features to exclude from auto-discovery.
 # Use for internal or alias features that should not be tested in isolation.
-exclude_features = ["default"]
+exclude_features = ["default", "fuzzing"]
 
 # Examples to run with different feature configurations.
 #

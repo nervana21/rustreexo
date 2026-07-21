@@ -111,3 +111,6 @@ pub mod pollard;
 pub mod proof;
 pub mod stump;
 pub(crate) mod util;
+
+#[cfg(feature = "fuzzing")]
+pub mod fuzz_harness;

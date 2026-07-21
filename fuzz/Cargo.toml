@@ -1,0 +1,123 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
+[package]
+name = "rustreexo-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2018"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = { version = "=0.4.12" }
+arbitrary = { version = "=1.4.2", features = ["derive"] }
+rustreexo = { path = "..", features = ["fuzzing"] }
+
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "position_helpers"
+path = "fuzz_targets/position_helpers.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "proof_deserialize"
+path = "fuzz_targets/proof_deserialize.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "proof_roundtrip"
+path = "fuzz_targets/proof_roundtrip.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "proof_verify"
+path = "fuzz_targets/proof_verify.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "proof_subset_update"
+path = "fuzz_targets/proof_subset_update.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "stump_deserialize"
+path = "fuzz_targets/stump_deserialize.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "stump_roundtrip"
+path = "fuzz_targets/stump_roundtrip.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "stump_modify"
+path = "fuzz_targets/stump_modify.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "pollard_deserialize"
+path = "fuzz_targets/pollard_deserialize.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "pollard_roundtrip"
+path = "fuzz_targets/pollard_roundtrip.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "pollard_stateful"
+path = "fuzz_targets/pollard_stateful.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "mem_forest_deserialize"
+path = "fuzz_targets/mem_forest_deserialize.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "mem_forest_roundtrip"
+path = "fuzz_targets/mem_forest_roundtrip.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "mem_forest_stateful"
+path = "fuzz_targets/mem_forest_stateful.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "accumulator_crosscheck"
+path = "fuzz_targets/accumulator_crosscheck.rs"
+test = false
+doc = false
+bench = false
