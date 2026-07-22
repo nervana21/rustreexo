@@ -141,7 +141,12 @@ impl<Hash: AccumulatorHash> Node<Hash> {
             let ty = match u64::from_le_bytes(ty) {
                 0 => NodeType::Branch,
                 1 => NodeType::Leaf,
-                _ => panic!("Invalid node type"),
+                _ => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "invalid node type",
+                    ))
+                }
             };
             if ty == NodeType::Leaf {
                 let leaf = Rc::new(Node {
@@ -1095,5 +1100,17 @@ mod test {
         assert_eq!(deserialized.get_roots().len(), 1);
         assert!(deserialized.get_roots()[0].get_data().is_empty());
         assert_eq!(deserialized.leaves, 16);
+    }
+
+    #[test]
+    fn test_deserialize_rejects_invalid_node_type() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&1u64.to_le_bytes()); // leaves
+        buf.extend_from_slice(&1u64.to_le_bytes()); // roots_len
+        buf.extend_from_slice(&2u64.to_le_bytes()); // invalid node type
+        buf.extend_from_slice(&[0u8; 32]); // hash
+        let res = MemForest::<BitcoinNodeHash>::deserialize(&*buf);
+        assert!(res.is_err());
+        assert_eq!(res.unwrap_err().kind(), io::ErrorKind::InvalidData);
     }
 }
