@@ -46,6 +46,7 @@ use super::util::is_left_niece;
 use super::util::is_root_populated;
 use super::util::left_child;
 use super::util::max_position_at_row;
+use super::util::num_roots;
 use super::util::right_child;
 use super::util::root_position;
 use super::util::tree_rows;
@@ -127,12 +128,24 @@ impl<Hash: AccumulatorHash> Node<Hash> {
     /// The primary use of this method is to deserialize the accumulator. In this case,
     /// you should call this method on each root in the forest, assuming you know how
     /// many roots there are.
+    ///
+    /// Depth is capped at [`MAX_FOREST_ROWS`] to bound stack use on untrusted input.
     #[allow(clippy::type_complexity)]
     pub fn read_one<R: Read>(reader: &mut R) -> io::Result<(Rc<Self>, HashMap<Hash, Weak<Self>>)> {
+        Self::read_one_bounded(reader, MAX_FOREST_ROWS)
+    }
+
+    /// Like [`read_one`], but rejects trees deeper than `max_depth`.
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn read_one_bounded<R: Read>(
+        reader: &mut R,
+        max_depth: u8,
+    ) -> io::Result<(Rc<Self>, HashMap<Hash, Weak<Self>>)> {
         fn _read_one<Hash: AccumulatorHash, R: Read>(
             ancestor: Option<Rc<Node<Hash>>>,
             reader: &mut R,
             index: &mut HashMap<Hash, Weak<Node<Hash>>>,
+            depth_left: u8,
         ) -> io::Result<Rc<Node<Hash>>> {
             let mut ty = [0u8; 8];
             reader.read_exact(&mut ty)?;
@@ -167,8 +180,14 @@ impl<Hash: AccumulatorHash> Node<Hash> {
                 right: RefCell::new(None),
             });
             if !data.is_empty() {
-                let left = _read_one(Some(node.clone()), reader, index)?;
-                let right = _read_one(Some(node.clone()), reader, index)?;
+                if depth_left == 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "tree depth exceeds forest rows",
+                    ));
+                }
+                let left = _read_one(Some(node.clone()), reader, index, depth_left - 1)?;
+                let right = _read_one(Some(node.clone()), reader, index, depth_left - 1)?;
                 node.left.replace(Some(left));
                 node.right.replace(Some(right));
             }
@@ -184,7 +203,7 @@ impl<Hash: AccumulatorHash> Node<Hash> {
             Ok(node)
         }
         let mut index = HashMap::with_hasher(Default::default());
-        let root = _read_one(None, reader, &mut index)?;
+        let root = _read_one(None, reader, &mut index, max_depth)?;
         Ok((root, index))
     }
 
@@ -214,13 +233,12 @@ pub struct MemForest<Hash: AccumulatorHash = BitcoinNodeHash> {
 /// Nodes are shared through `Rc` + interior mutability (`RefCell`/`Cell`). A derived
 /// `Clone` would only bump refcounts, so mutating one forest would corrupt any alias.
 /// Round-tripping through the wire format rebuilds an independent tree and leaf map.
+///
+/// Prefer [`MemForest::try_clone`] when clone failure must not panic.
 impl<Hash: AccumulatorHash> Clone for MemForest<Hash> {
     fn clone(&self) -> Self {
-        let mut buf = Vec::new();
-        self.serialize(&mut buf)
-            .expect("MemForest::clone: serialize in-memory buffer");
-        Self::deserialize(buf.as_slice())
-            .expect("MemForest::clone: deserialize roundtrip")
+        self.try_clone()
+            .expect("MemForest::clone: in-memory serialize/deserialize roundtrip")
     }
 }
 
@@ -244,6 +262,13 @@ impl MemForest {
 }
 
 impl<Hash: AccumulatorHash> MemForest<Hash> {
+    /// Fallible deep clone via serialize/deserialize roundtrip.
+    pub fn try_clone(&self) -> io::Result<Self> {
+        let mut buf = Vec::new();
+        self.serialize(&mut buf)?;
+        Self::deserialize(buf.as_slice())
+    }
+
     /// Creates a new empty [MemForest] with a custom hash function.
     /// # Example
     /// ```
@@ -280,7 +305,7 @@ impl<Hash: AccumulatorHash> MemForest<Hash> {
         writer.write_all(&(self.roots.len() as u64).to_le_bytes())?;
 
         for root in &self.roots {
-            root.write_one(&mut writer).unwrap();
+            root.write_one(&mut writer)?;
         }
 
         Ok(())
@@ -304,12 +329,20 @@ impl<Hash: AccumulatorHash> MemForest<Hash> {
             Ok(u64::from_le_bytes(buf))
         }
         let leaves = read_u64(&mut reader)?;
-        tree_rows(leaves).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let forest_rows =
+            tree_rows(leaves).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         let roots_len = read_u64(&mut reader)?;
+        let expected = num_roots(leaves) as u64;
+        if roots_len != expected {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("roots_len {roots_len} != num_roots({leaves})={expected}"),
+            ));
+        }
         let mut roots = Vec::new();
         let mut map = HashMap::with_hasher(Default::default());
         for _ in 0..roots_len {
-            let (root, _map) = Node::read_one(&mut reader)?;
+            let (root, _map) = Node::read_one_bounded(&mut reader, forest_rows)?;
             map.extend(_map);
             roots.push(root);
         }
@@ -350,8 +383,8 @@ impl<Hash: AccumulatorHash> MemForest<Hash> {
         let needed = get_proof_positions(&positions, self.leaves, tree_rows(self.leaves)?)?;
         let proof = needed
             .iter()
-            .map(|pos| self.get_hash(*pos).unwrap())
-            .collect::<Vec<_>>();
+            .map(|pos| self.get_hash(*pos))
+            .collect::<Result<Vec<_>, _>>()?;
 
         let tree_rows = tree_rows(self.leaves)?;
         let translated_targets = positions
@@ -713,7 +746,10 @@ impl<Hash: AccumulatorHash> MemForest<Hash> {
         for h in 0..=fh {
             let row_len = 1 << (fh - h);
             for _ in 0..row_len {
-                let max = max_position_at_row(h, fh, self.leaves).unwrap();
+                let max = match max_position_at_row(h, fh, self.leaves) {
+                    Ok(m) => m,
+                    Err(_) => return format!("invalid geometry at row {h}"),
+                };
                 if max >= pos as u64 {
                     match self.get_hash(pos as u64) {
                         Ok(val) => {
@@ -1223,6 +1259,16 @@ mod test {
         buf.extend_from_slice(&0u64.to_le_bytes());
         let res = MemForest::<BitcoinNodeHash>::deserialize(&*buf);
         assert!(res.is_err());
+    }
+
+    #[test]
+    fn test_deserialize_rejects_roots_len_mismatch() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&1u64.to_le_bytes()); // leaves
+        buf.extend_from_slice(&99u64.to_le_bytes()); // roots_len != num_roots(1)
+        let res = MemForest::<BitcoinNodeHash>::deserialize(&*buf);
+        assert!(res.is_err());
+        assert_eq!(res.unwrap_err().kind(), io::ErrorKind::InvalidData);
     }
 
     #[test]

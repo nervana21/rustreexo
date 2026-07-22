@@ -91,6 +91,11 @@ impl From<ProofError> for StumpError {
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[cfg_attr(feature = "with-serde", derive(Serialize, Deserialize))]
+/// Compact Utreexo accumulator: leaf count plus packed roots (highest row first).
+///
+/// When `with-serde` is enabled, serde `Deserialize` does not enforce
+/// `roots.len() == num_roots(leaves)`; treat serde input as trusted or validate
+/// yourself. Binary [`Stump::deserialize`] does enforce that invariant.
 pub struct Stump<Hash: AccumulatorHash = BitcoinNodeHash> {
     pub leaves: u64,
     pub roots: Vec<Hash>,
@@ -306,6 +311,10 @@ impl<Hash: AccumulatorHash> Stump<Hash> {
         util::tree_rows(leaves)
             .map_err(|_| StumpError::InvalidProof(ProofError::InvalidPosition))?;
         let roots_len = util::read_u64(&mut data)?;
+        let expected = util::num_roots(leaves) as u64;
+        if roots_len != expected {
+            return Err(StumpError::InvalidProof(ProofError::InvalidPosition));
+        }
         let mut roots = vec![];
 
         for _ in 0..roots_len {
@@ -750,6 +759,19 @@ mod test {
         let mut buf = Vec::new();
         buf.extend_from_slice(&((1u64 << 63) + 1).to_le_bytes());
         buf.extend_from_slice(&0u64.to_le_bytes());
+        let res = Stump::<BitcoinNodeHash>::deserialize(Cursor::new(buf));
+        assert!(matches!(
+            res,
+            Err(StumpError::InvalidProof(ProofError::InvalidPosition))
+        ));
+    }
+
+    #[test]
+    fn test_deserialize_rejects_roots_len_mismatch() {
+        // leaves=1 expects 1 root; claim 99 roots without providing them.
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&1u64.to_le_bytes());
+        buf.extend_from_slice(&99u64.to_le_bytes());
         let res = Stump::<BitcoinNodeHash>::deserialize(Cursor::new(buf));
         assert!(matches!(
             res,

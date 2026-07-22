@@ -35,6 +35,10 @@
 //!
 //! ## Usage
 //!
+//! For untrusted proofs from the network, prefer [`Pollard::verify_and_ingest`] (or
+//! [`Pollard::verify`] then ingest) over [`Pollard::modify`] / [`Pollard::ingest_proof`],
+//! which apply changes without checking proof validity.
+//!
 //! //TODO: Add usage examples
 
 use alloc::rc::Rc;
@@ -42,7 +46,6 @@ use alloc::rc::Weak;
 use core::array;
 use core::cell::Cell;
 use core::cell::RefCell;
-use core::convert::TryInto;
 use core::fmt;
 use core::fmt::Debug;
 use core::fmt::Display;
@@ -277,6 +280,7 @@ impl<Hash: AccumulatorHash> PollardNode<Hash> {
         reader: &mut R,
         ancestor: Option<Weak<Self>>,
         leaf_map: &mut HashMap<Hash, Weak<Self>>,
+        depth_left: u8,
     ) -> Result<Rc<Self>, PollardError<Hash>> {
         let mut is_leaf = [0u8; 1];
         reader.read_exact(&mut is_leaf)?;
@@ -298,6 +302,10 @@ impl<Hash: AccumulatorHash> PollardNode<Hash> {
             return Ok(node);
         }
 
+        if depth_left == 0 {
+            return Err(PollardError::InvalidPosition);
+        }
+
         let node = Rc::new(Self {
             remember: true,
             hash: Cell::new(hash),
@@ -308,8 +316,8 @@ impl<Hash: AccumulatorHash> PollardNode<Hash> {
 
         let node_weak = Rc::downgrade(&node);
 
-        let left = Self::deserialize(reader, Some(node_weak.clone()), leaf_map)?;
-        let right = Self::deserialize(reader, Some(node_weak), leaf_map)?;
+        let left = Self::deserialize(reader, Some(node_weak.clone()), leaf_map, depth_left - 1)?;
+        let right = Self::deserialize(reader, Some(node_weak), leaf_map, depth_left - 1)?;
 
         node.left_niece.replace(Some(left));
         node.right_niece.replace(Some(right));
@@ -634,8 +642,8 @@ impl<Hash: AccumulatorHash> Pollard<Hash> {
     /// This function takes a proof and a list of hashes for the nodes in that proof. It will
     /// take all the nodes in the proof and add them to the [Pollard], so we can generate proofs
     /// for them later. This function doesn't check the validity of the proof, so you should do
-    /// that before calling this function. If the proof is not valid, this function will return an
-    /// error.
+    /// that before calling this function (or use [`Pollard::verify_and_ingest`]). If the proof is
+    /// not valid, this function will return an error.
     pub fn ingest_proof(
         &mut self,
         proof: Proof<Hash>,
@@ -776,8 +784,9 @@ impl<Hash: AccumulatorHash> Pollard<Hash> {
     /// be added to the accumulator, and whether it should be remembered or not.
     /// The deletions should be passed as a list of target positions, telling which nodes should be
     /// deleted from the accumulator. Positions that are not cached will be ignored. You should check
-    /// the validity of the proof before calling this function, as it will blindly apply the changes
-    /// to the [Pollard] without validating anything.
+    /// the validity of the proof before calling this function (prefer [`Pollard::verify_and_ingest`]
+    /// for untrusted proofs), as it will blindly apply the changes to the [Pollard] without
+    /// validating anything.
     pub fn modify(
         &mut self,
         adds: &[PollardAddition<Hash>],
@@ -828,23 +837,25 @@ impl<Hash: AccumulatorHash> Pollard<Hash> {
     /// keep track of a subset of the whole tree. Instead of remputing the pollard from genesis for
     /// every flavor of accumulator you have, you can sync-up using the [Stump] and then use its
     /// roots to create a up-to-date pollard.
+    ///
+    /// `roots` must be in Stump order: packed, highest row first (same as [`Stump::roots`]).
+    /// Internally this Pollard stores roots in row-indexed slots; [`Pollard::roots`] exports
+    /// them in ascending row order.
     pub fn from_roots(roots: Vec<Hash>, leaves: u64) -> Self {
-        let mut pollard = Self::new();
-        pollard.leaves = leaves;
+        let mut pollard_roots: [Option<Rc<PollardNode<Hash>>>; 64] = array::from_fn(|_| None);
+        let mut packed = roots.into_iter();
 
-        let roots = (0..=63)
-            .map(|x| {
-                if is_root_populated(x, leaves).expect("row in 0..=63") {
-                    return Some(PollardNode::<Hash>::new(*roots.get(x as usize)?, true));
+        // Stump packs highest row first. Consume that order while filling row slots.
+        for row in (0u8..=63).rev() {
+            if is_root_populated(row, leaves).expect("row in 0..=63") {
+                if let Some(hash) = packed.next() {
+                    pollard_roots[row as usize] = Some(PollardNode::<Hash>::new(hash, true));
                 }
-                None
-            })
-            .collect::<Vec<_>>()
-            .try_into()
-            .unwrap();
+            }
+        }
 
         Self {
-            roots,
+            roots: pollard_roots,
             leaves,
             leaf_map: HashMap::with_hasher(Default::default()),
         }
@@ -886,7 +897,7 @@ impl<Hash: AccumulatorHash> Pollard<Hash> {
         reader.read_exact(&mut leaves)?;
         let leaves = u64::from_be_bytes(leaves);
 
-        tree_rows(leaves).map_err(|_| PollardError::InvalidPosition)?;
+        let forest_rows = tree_rows(leaves).map_err(|_| PollardError::InvalidPosition)?;
 
         let mut pollard = Self::new();
         pollard.leaves = leaves;
@@ -901,6 +912,7 @@ impl<Hash: AccumulatorHash> Pollard<Hash> {
                     reader,
                     None,
                     &mut pollard.leaf_map,
+                    forest_rows,
                 )?);
             }
         }
@@ -1082,7 +1094,10 @@ impl<Hash: AccumulatorHash> Pollard<Hash> {
         for h in 0..=fh {
             let row_len = 1 << (fh - h);
             for _ in 0..row_len {
-                let max = max_position_at_row(h, fh, self.leaves).unwrap();
+                let max = match max_position_at_row(h, fh, self.leaves) {
+                    Ok(m) => m,
+                    Err(_) => return format!("invalid geometry at row {h}"),
+                };
                 if max >= pos as u64 {
                     match self.get_hash(pos as u64) {
                         Ok(val) => {
@@ -1276,7 +1291,7 @@ impl<Hash: AccumulatorHash> Pollard<Hash> {
             return Err(PollardError::RootNotFound);
         };
 
-        sibling.migrate_up().unwrap();
+        sibling.migrate_up()?;
         Ok(())
     }
 
@@ -1433,35 +1448,65 @@ mod tests {
 
     #[test]
     fn test_from_roots() {
+        // Stump order = highest row first. leaves=15 populates rows 0..=3.
         let roots = vec![
-            hash_from_u8(0),
-            hash_from_u8(1),
-            hash_from_u8(2),
             hash_from_u8(3),
+            hash_from_u8(2),
+            hash_from_u8(1),
+            hash_from_u8(0),
         ];
-
         let leaves = 15;
 
         let p = Pollard::<BitcoinNodeHash>::from_roots(roots.clone(), leaves);
-        assert_eq!(roots, p.roots());
+        // Pollard::roots() exports ascending row order.
+        let ascending: Vec<_> = roots.iter().copied().rev().collect();
+        assert_eq!(ascending, p.roots());
         assert_eq!(leaves, p.leaves());
     }
 
     #[test]
     fn test_from_stump() {
-        let roots = vec![
-            hash_from_u8(0),
-            hash_from_u8(1),
-            hash_from_u8(2),
-            hash_from_u8(3),
-        ];
-        let leaves = 15;
-
-        let stump = Stump { roots, leaves };
+        let hashes: Vec<_> = (0u8..15).map(hash_from_u8).collect();
+        let (stump, _) = Stump::new()
+            .modify(&hashes, &[], &Proof::default())
+            .unwrap();
         let p: Pollard<BitcoinNodeHash> = stump.clone().into();
 
-        assert_eq!(stump.roots, p.roots());
-        assert_eq!(leaves, p.leaves());
+        assert_eq!(
+            stump.roots.iter().copied().rev().collect::<Vec<_>>(),
+            p.roots()
+        );
+        assert_eq!(stump.leaves, p.leaves());
+    }
+
+    #[test]
+    fn test_from_stump_sparse_leaves() {
+        // leaves=5 => roots at rows 0 and 2; packed index != row index.
+        let hashes: Vec<_> = (0u8..5).map(hash_from_u8).collect();
+        let (stump, _) = Stump::new()
+            .modify(&hashes, &[], &Proof::default())
+            .unwrap();
+        let from_stump: Pollard<BitcoinNodeHash> = stump.clone().into();
+
+        let mut via_modify = Pollard::<BitcoinNodeHash>::new();
+        let batch: Vec<_> = hashes
+            .iter()
+            .copied()
+            .map(|hash| PollardAddition {
+                hash,
+                remember: true,
+            })
+            .collect();
+        via_modify
+            .modify(&batch, &[], Proof::default())
+            .unwrap();
+
+        assert_eq!(from_stump.roots(), via_modify.roots());
+        assert_eq!(
+            stump.roots.iter().copied().rev().collect::<Vec<_>>(),
+            from_stump.roots()
+        );
+        assert_eq!(stump.leaves, from_stump.leaves());
     }
 
     #[test]

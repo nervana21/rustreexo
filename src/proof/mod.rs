@@ -152,6 +152,14 @@ impl From<io::Error> for ProofError {
 /// points to a leaf to be proven. Hashes are all
 /// hashes that can't be calculated from the data itself.
 /// Proofs are generated elsewhere.
+///
+/// # Untrusted input
+///
+/// [`Proof::deserialize`] enforces wire length caps (`MAX_PROOF_TARGET_COUNT` /
+/// `MAX_PROOF_HASH_COUNT`). [`Proof::new`], [`Proof::new_with_hash`], and
+/// (when enabled) serde `Deserialize` do **not** apply those caps — treat
+/// constructed or serde-decoded proofs as trusted unless you validate sizes
+/// yourself.
 pub struct Proof<Hash: AccumulatorHash = BitcoinNodeHash> {
     /// Targets are the i'th of leaf locations to delete and they are the bottommost leaves.
     /// With the tree below, the Targets can only consist of one of these: 02, 03, 04.
@@ -207,6 +215,9 @@ impl Proof {
     /// trying to prove.
     /// `hashes` are of type `AccumulatorHash` and are all hashes we need for computing the roots.
     ///
+    /// Does **not** enforce the deserialize size caps; for untrusted vectors prefer
+    /// [`Proof::deserialize`].
+    ///
     /// Assuming a tree with leaf values [0, 1, 2, 3, 4, 5, 6, 7], we should see something like this:
     ///```text
     /// // 14
@@ -245,6 +256,9 @@ impl<Hash: AccumulatorHash> Proof<Hash> {
     /// `targets` are u64s and indicates the position of the leaves we are
     /// trying to prove.
     /// `hashes` are of type `AccumulatorHash` and are all hashes we need for computing the roots.
+    ///
+    /// Does **not** enforce the deserialize size caps; for untrusted vectors prefer
+    /// [`Proof::deserialize`].
     ///
     /// Different from `new`, this function allows for the proof to be created with a different
     /// hash type, as long as it implements `AccumulatorHash`.
@@ -346,7 +360,15 @@ impl<Hash: AccumulatorHash> Proof<Hash> {
         roots: &[Hash],
         num_leaves: u64,
     ) -> Result<bool, ProofError> {
+        // Vacuous membership only when both sides empty. Non-empty del_hashes with
+        // empty targets would otherwise skip the length check in calculate_hashes.
         if self.targets.is_empty() {
+            if !del_hashes.is_empty() {
+                return Err(ProofError::DelHashesTargetsMismatch {
+                    targets: 0,
+                    del_hashes: del_hashes.len(),
+                });
+            }
             return Ok(true);
         }
 
@@ -1651,6 +1673,20 @@ mod tests {
 
             assert_eq!(s.verify(&proof, &set_hashes), Ok(true));
         }
+    }
+
+    #[test]
+    fn test_verify_empty_targets_require_empty_del_hashes() {
+        let proof = Proof::<BitcoinNodeHash>::default();
+        let del_hashes = vec![BitcoinNodeHash::empty()];
+        assert_eq!(
+            proof.verify(&del_hashes, &[], 0),
+            Err(ProofError::DelHashesTargetsMismatch {
+                targets: 0,
+                del_hashes: 1,
+            })
+        );
+        assert_eq!(proof.verify(&[], &[], 0), Ok(true));
     }
 
     #[test]

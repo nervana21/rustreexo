@@ -206,9 +206,10 @@ pub fn roots_to_destroy<Hash: AccumulatorHash>(
 
     let mut roots = orig_roots.to_vec();
     let mut deleted = vec![];
-    let mut h = 0;
+    // Carry height. Must stay below 64 or `num_leaves >> h` panics (shift >= width).
+    let mut h: u8 = 0;
     for add in 0..num_adds {
-        while (num_leaves >> h) & 1 == 1 {
+        while h < 64 && (num_leaves >> h) & 1 == 1 {
             let root = roots.pop().ok_or_else(|| {
                 format!(
                     "roots_to_destroy: missing root at height {h} for {num_leaves} leaves"
@@ -227,6 +228,11 @@ pub fn roots_to_destroy<Hash: AccumulatorHash>(
                 deleted.push(root_pos);
             }
             h += 1;
+        }
+        if h >= 64 {
+            return Err(format!(
+                "roots_to_destroy: height overflow for {num_leaves} leaves"
+            ));
         }
         // Just adding a non-zero value to the slice.
         roots.push(AccumulatorHash::placeholder());
@@ -600,6 +606,22 @@ mod tests {
         // One empty root enters the destroy path; leaf popcount still needs more pops → err.
         let roots = vec![BitcoinNodeHash::Empty];
         assert!(roots_to_destroy(1, 15, &roots).is_err());
+    }
+
+    #[test]
+    fn test_roots_to_destroy_height_overflow() {
+        // position_helpers crash-ac631501: near-max leaf count + enough adds
+        // carries `h` to 64. Must Err, not panic on `num_leaves >> h`.
+        let roots = [
+            BitcoinNodeHash::Empty,
+            BitcoinNodeHash::from([1; 32]),
+            BitcoinNodeHash::Placeholder,
+        ];
+        assert!(roots_to_destroy(64, 0xffffffffffffff81, &roots).is_err());
+
+        // Full 63-row forest: second add carries through bit 63 = h == 64.
+        let full_roots = vec![BitcoinNodeHash::Empty; 64];
+        assert!(roots_to_destroy(2, (1u64 << 63) - 1, &full_roots).is_err());
     }
 
     #[test]

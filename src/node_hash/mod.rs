@@ -49,6 +49,7 @@
 //! ```
 
 use core::convert::TryFrom;
+use core::convert::TryInto;
 use core::fmt;
 use core::fmt::Debug;
 use core::fmt::Display;
@@ -192,11 +193,14 @@ impl TryFrom<&str> for BitcoinNodeHash {
     }
 }
 
-impl From<&[u8]> for BitcoinNodeHash {
-    fn from(hash: &[u8]) -> Self {
-        let mut inner = [0; 32];
-        inner.copy_from_slice(hash);
-        Self::Some(inner)
+/// Fallible conversion from a byte slice. Prefer this over panicking constructors
+/// when the slice length is untrusted. For fixed arrays use [`From<[u8; 32]>`].
+impl TryFrom<&[u8]> for BitcoinNodeHash {
+    type Error = &'static str;
+
+    fn try_from(hash: &[u8]) -> Result<Self, Self::Error> {
+        let arr: &[u8; 32] = hash.try_into().map_err(|_| "expected 32-byte slice")?;
+        Ok(Self::Some(*arr))
     }
 }
 
