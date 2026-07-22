@@ -309,7 +309,12 @@ impl<Hash: AccumulatorHash> PollardNode<Hash> {
         }
 
         let granparent = granparent.unwrap();
-        if granparent.left_niece().eq(&self.aunt()) {
+        let aunt = self.aunt();
+        let left = granparent.left_niece();
+        if match (left.as_ref(), aunt.as_ref()) {
+            (Some(left), Some(aunt)) => Rc::ptr_eq(left, aunt),
+            _ => false,
+        } {
             granparent.right_niece()
         } else {
             granparent.left_niece()
@@ -347,12 +352,19 @@ impl<Hash: AccumulatorHash> PollardNode<Hash> {
     ///
     /// This function should return an [Rc] containing the sibling of this node. If this node is a
     /// root, it should return `None`, as roots don't have siblings.
+    ///
+    /// Identity is by pointer, not hash: two leaves may share a hash, and hash equality would
+    /// wrongly treat the target as its own sibling.
     fn sibling(&self) -> Option<Rc<Self>> {
         let aunt = self.aunt()?;
-        if aunt.left_niece()?.hash() == self.hash() {
-            aunt.right_niece()
+        let left = aunt.left_niece()?;
+        let right = aunt.right_niece()?;
+        if core::ptr::eq(left.as_ref(), self) {
+            Some(right)
+        } else if core::ptr::eq(right.as_ref(), self) {
+            Some(left)
         } else {
-            aunt.left_niece()
+            None
         }
     }
 
@@ -433,7 +445,8 @@ impl<Hash: AccumulatorHash> PollardNode<Hash> {
 
         let left_niece = aunt.left_niece().ok_or(PollardError::NieceNotFound)?;
 
-        let _self = if left_niece.hash() == self.hash() {
+        // Pointer identity: duplicate hashes must not pick the wrong niece.
+        let _self = if core::ptr::eq(left_niece.as_ref(), self) {
             aunt.left_niece().ok_or(PollardError::NieceNotFound)?
         } else {
             aunt.right_niece().ok_or(PollardError::NieceNotFound)?
@@ -443,7 +456,7 @@ impl<Hash: AccumulatorHash> PollardNode<Hash> {
             .left_niece()
             .ok_or(PollardError::NieceNotFound)?;
 
-        let (left_niece, right_niece) = if left_niece.hash() == aunt.hash() {
+        let (left_niece, right_niece) = if Rc::ptr_eq(&left_niece, &aunt) {
             let left_niece = grandparent
                 .left_niece()
                 .ok_or(PollardError::NieceNotFound)?;
@@ -1184,7 +1197,10 @@ impl<Hash: AccumulatorHash> Pollard<Hash> {
         // we are deleting a root, just write an empty hash where it was
         if node.aunt.borrow().is_none() {
             for i in 0..64 {
-                if self.roots[i].eq(&Some(node.clone())) {
+                if self.roots[i]
+                    .as_ref()
+                    .is_some_and(|root| Rc::ptr_eq(root, &node))
+                {
                     self.roots[i] = Some(Rc::new(PollardNode::default()));
                     return Ok(());
                 }
@@ -1206,7 +1222,7 @@ impl<Hash: AccumulatorHash> Pollard<Hash> {
                     continue;
                 };
 
-                if root.hash() == aunt.hash() {
+                if Rc::ptr_eq(root, &aunt) {
                     self.roots[i] = Some(sibling);
                     return Ok(());
                 }
@@ -1232,7 +1248,7 @@ impl<Hash: AccumulatorHash> Pollard<Hash> {
             let aunt_left = aunt.children().ok_or(PollardError::CouldNotFindChildren)?.0;
             // If the current node is a left child, we left-shift the indicator
             // and leave the LSB as 0
-            if aunt_left.hash() == node.hash() {
+            if Rc::ptr_eq(&aunt_left, &node) {
                 left_child_indicator <<= 1;
             } else {
                 // If the current node is a right child, we left-shift the indicator
@@ -1246,7 +1262,7 @@ impl<Hash: AccumulatorHash> Pollard<Hash> {
 
         let root_row = self.roots.iter().position(|root| {
             if let Some(root) = root {
-                return root.hash() == node.hash();
+                return Rc::ptr_eq(root, &node);
             }
 
             false
@@ -1745,6 +1761,44 @@ mod tests {
                 }
             })
             .collect()
+    }
+
+    #[test]
+    /// Regression: pollard_stateful crash-7799d8b0… — add four leaves with three
+    /// identical hashes, then delete one. Hash-based sibling checks treated the
+    /// target as its own sibling and `migrate_up` / `recompute_hashes` stack
+    /// overflowed. Structural ops now use pointer identity.
+    #[test]
+    fn test_delete_duplicate_leaf_hash_does_not_stack_overflow() {
+        let a = BitcoinNodeHash::from([162u8; 32]);
+        let b = BitcoinNodeHash::from([255u8; 32]);
+        let adds = [
+            PollardAddition {
+                hash: a,
+                remember: false,
+            },
+            PollardAddition {
+                hash: b,
+                remember: true,
+            },
+            PollardAddition {
+                hash: b,
+                remember: true,
+            },
+            PollardAddition {
+                hash: b,
+                remember: true,
+            },
+        ];
+        let mut p = Pollard::new();
+        p.modify(&adds, &[], Proof::default())
+            .expect("add duplicate leaf hashes");
+        assert_eq!(p.leaves(), 4);
+
+        // leaf_map keeps the last insert for hash `b` (position 3).
+        let proof = p.prove_single(b).expect("prove last duplicate");
+        p.modify(&[], &[b], proof).expect("delete duplicate leaf");
+        assert_eq!(p.leaves(), 4);
     }
 
     #[test]
