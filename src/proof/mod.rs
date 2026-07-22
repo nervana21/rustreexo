@@ -91,6 +91,9 @@ pub enum ProofError {
     /// A target position could not be parsed during deserialization.
     InvalidTarget,
 
+    /// Forest position / leaf-count geometry is out of bounds or overflowed.
+    InvalidPosition,
+
     /// A hash could not be parsed during deserialization.
     InvalidHash,
 
@@ -107,11 +110,18 @@ pub enum ProofError {
     DelHashesTargetsMismatch { targets: usize, del_hashes: usize },
 }
 
+impl ProofError {
+    pub(crate) fn from_position(_err: String) -> Self {
+        Self::InvalidPosition
+    }
+}
+
 impl fmt::Display for ProofError {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
             Self::Io(kind) => write!(f, "I/O error: {kind:?}"),
             Self::InvalidTarget => write!(f, "failed to parse proof target"),
+            Self::InvalidPosition => write!(f, "invalid forest position or leaf count"),
             Self::InvalidHash => write!(f, "failed to parse proof hash"),
             Self::MissingSibling(pos) => write!(f, "missing sibling for node at position {pos}"),
             Self::MissingProofHash(pos) => {
@@ -383,9 +393,11 @@ impl<Hash: AccumulatorHash> Proof<Hash> {
         new_targets: &[u64],
         num_leaves: u64,
     ) -> Result<Self, ProofError> {
-        let forest_rows = tree_rows(num_leaves);
-        let old_proof_positions = get_proof_positions(&self.targets, num_leaves, forest_rows);
-        let needed_positions = get_proof_positions(new_targets, num_leaves, forest_rows);
+        let forest_rows = tree_rows(num_leaves).map_err(ProofError::from_position)?;
+        let old_proof_positions = get_proof_positions(&self.targets, num_leaves, forest_rows)
+            .map_err(ProofError::from_position)?;
+        let needed_positions = get_proof_positions(new_targets, num_leaves, forest_rows)
+            .map_err(ProofError::from_position)?;
         let (intermediate_positions, _) = self.calculate_hashes(del_hashes, num_leaves)?;
 
         let mut old_proof = old_proof_positions
@@ -514,7 +526,7 @@ impl<Hash: AccumulatorHash> Proof<Hash> {
         }
 
         // Where all the root hashes that we've calculated will go to.
-        let total_rows = util::tree_rows(num_leaves);
+        let total_rows = util::tree_rows(num_leaves).map_err(ProofError::from_position)?;
 
         // Where all the parent hashes we've calculated in a given row will go to.
         let mut calculated_root_hashes =
@@ -526,8 +538,10 @@ impl<Hash: AccumulatorHash> Proof<Hash> {
             .iter()
             .copied()
             .map(|pos| translate(pos, MAX_FOREST_ROWS, total_rows))
-            .collect();
-        let proof_positions = get_proof_positions(&translated, num_leaves, total_rows);
+            .collect::<Result<_, _>>()
+            .map_err(ProofError::from_position)?;
+        let proof_positions = get_proof_positions(&translated, num_leaves, total_rows)
+            .map_err(ProofError::from_position)?;
 
         // As we calculate nodes upwards, it accumulates here
         let mut nodes: Vec<_> = translated
@@ -552,7 +566,9 @@ impl<Hash: AccumulatorHash> Proof<Hash> {
         while let Some((next_pos, (next_hash_old, next_hash_new))) =
             Self::get_next(&computed, &nodes, &mut computed_index, &mut provided_index)
         {
-            if util::is_root_position(next_pos, num_leaves, total_rows) {
+            if util::is_root_position(next_pos, num_leaves, total_rows)
+                .map_err(ProofError::from_position)?
+            {
                 calculated_root_hashes.push((next_hash_old, next_hash_new));
                 continue;
             }
@@ -573,7 +589,8 @@ impl<Hash: AccumulatorHash> Proof<Hash> {
                 (false, false) => AccumulatorHash::parent_hash(&next_hash_new, &sibling_hash_new),
             };
 
-            let parent = util::parent(next_pos, total_rows);
+            let parent =
+                util::parent(next_pos, total_rows).map_err(ProofError::from_position)?;
             let old_parent_hash = AccumulatorHash::parent_hash(&next_hash_old, &sibling_hash_old);
             computed.push((parent, (old_parent_hash, parent_hash)));
         }
@@ -608,7 +625,7 @@ impl<Hash: AccumulatorHash> Proof<Hash> {
         }
 
         // Where all the root hashes that we've calculated will go to.
-        let total_rows = util::tree_rows(num_leaves);
+        let total_rows = util::tree_rows(num_leaves).map_err(ProofError::from_position)?;
 
         // Where all the parent hashes we've calculated in a given row will go to.
         let mut calculated_root_hashes = Vec::<Hash>::with_capacity(util::num_roots(num_leaves));
@@ -619,8 +636,10 @@ impl<Hash: AccumulatorHash> Proof<Hash> {
             .iter()
             .copied()
             .map(|pos| translate(pos, MAX_FOREST_ROWS, total_rows))
-            .collect();
-        let proof_positions = get_proof_positions(&translated, num_leaves, total_rows);
+            .collect::<Result<_, _>>()
+            .map_err(ProofError::from_position)?;
+        let proof_positions = get_proof_positions(&translated, num_leaves, total_rows)
+            .map_err(ProofError::from_position)?;
 
         // As we calculate nodes upwards, it accumulates here
         let mut nodes: Vec<_> = translated
@@ -646,7 +665,9 @@ impl<Hash: AccumulatorHash> Proof<Hash> {
         while let Some((next_pos, next_hash)) =
             Self::get_next(&computed, &nodes, &mut computed_index, &mut provided_index)
         {
-            if util::is_root_position(next_pos, num_leaves, total_rows) {
+            if util::is_root_position(next_pos, num_leaves, total_rows)
+                .map_err(ProofError::from_position)?
+            {
                 calculated_root_hashes.push(next_hash);
                 continue;
             }
@@ -661,7 +682,8 @@ impl<Hash: AccumulatorHash> Proof<Hash> {
             }
 
             let parent_hash = AccumulatorHash::parent_hash(&next_hash, &sibling_hash);
-            let parent = util::parent(next_pos, total_rows);
+            let parent =
+                util::parent(next_pos, total_rows).map_err(ProofError::from_position)?;
             computed.push((parent, parent_hash));
         }
 
@@ -754,19 +776,22 @@ impl<Hash: AccumulatorHash> Proof<Hash> {
         let proof_pos = get_proof_positions(
             &self.targets,
             before_num_leaves,
-            util::tree_rows(before_num_leaves),
-        );
+            util::tree_rows(before_num_leaves).map_err(ProofError::from_position)?,
+        )
+        .map_err(ProofError::from_position)?;
         let proof_with_pos = proof_pos.into_iter().zip(self.hashes).collect();
 
         // Remap the positions if we moved up a after the addition row.
         let targets_after_remap =
-            Self::maybe_remap(before_num_leaves, adds.len() as u64, orig_targets_with_hash);
+            Self::maybe_remap(before_num_leaves, adds.len() as u64, orig_targets_with_hash)?;
         let mut final_targets = targets_after_remap;
         let mut new_nodes_iter = new_nodes.iter();
         let mut proof_with_pos =
-            Self::maybe_remap(before_num_leaves, adds.len() as u64, proof_with_pos);
+            Self::maybe_remap(before_num_leaves, adds.len() as u64, proof_with_pos)?;
 
-        let num_leaves = before_num_leaves + (adds.len() as u64);
+        let num_leaves = before_num_leaves
+            .checked_add(adds.len() as u64)
+            .ok_or(ProofError::InvalidPosition)?;
         // Move up positions that need to be moved up due to the empty roots
         // being written over.
         for node in to_destroy {
@@ -793,7 +818,12 @@ impl<Hash: AccumulatorHash> Proof<Hash> {
             final_targets.clone().into_iter().unzip();
         // Grab all the new nodes after this add.
         let mut needed_proof_positions =
-            util::get_proof_positions(&new_target_pos, num_leaves, util::tree_rows(num_leaves));
+            util::get_proof_positions(
+                &new_target_pos,
+                num_leaves,
+                util::tree_rows(num_leaves).map_err(ProofError::from_position)?,
+            )
+            .map_err(ProofError::from_position)?;
         needed_proof_positions.sort();
 
         // We'll use all elements from the old proof, as addition only creates new nodes
@@ -833,26 +863,33 @@ impl<Hash: AccumulatorHash> Proof<Hash> {
         num_leaves: u64,
         num_adds: u64,
         positions: Vec<(u64, Hash)>,
-    ) -> Vec<(u64, Hash)> {
-        let new_forest_rows = util::tree_rows(num_leaves + num_adds);
-        let old_forest_rows = util::tree_rows(num_leaves);
-        let tree_rows = util::tree_rows(num_leaves);
+    ) -> Result<Vec<(u64, Hash)>, ProofError> {
+        let after_leaves = num_leaves
+            .checked_add(num_adds)
+            .ok_or(ProofError::InvalidPosition)?;
+        let new_forest_rows =
+            util::tree_rows(after_leaves).map_err(ProofError::from_position)?;
+        let old_forest_rows = util::tree_rows(num_leaves).map_err(ProofError::from_position)?;
+        let tree_rows = old_forest_rows;
         let mut new_proofs = vec![];
         if new_forest_rows > old_forest_rows {
             for (pos, hash) in positions.iter() {
-                let row = util::detect_row(*pos, tree_rows);
+                let row =
+                    util::detect_row(*pos, tree_rows).map_err(ProofError::from_position)?;
 
-                let old_start_pos = util::start_position_at_row(row, old_forest_rows);
-                let new_start_pos = util::start_position_at_row(row, new_forest_rows);
+                let old_start_pos = util::start_position_at_row(row, old_forest_rows)
+                    .map_err(ProofError::from_position)?;
+                let new_start_pos = util::start_position_at_row(row, new_forest_rows)
+                    .map_err(ProofError::from_position)?;
 
                 let offset = pos - old_start_pos;
                 let new_pos = offset + new_start_pos;
                 new_proofs.push((new_pos, *hash));
             }
-            return new_proofs;
+            return Ok(new_proofs);
         }
 
-        positions
+        Ok(positions)
     }
 
     /// update_proof_remove modifies the cached proof with the deletions that happen in the block proof.
@@ -864,7 +901,7 @@ impl<Hash: AccumulatorHash> Proof<Hash> {
         updated: Vec<(u64, Hash)>,
         num_leaves: u64,
     ) -> Result<(Self, Vec<Hash>), ProofError> {
-        let total_rows = util::tree_rows(num_leaves);
+        let total_rows = util::tree_rows(num_leaves).map_err(ProofError::from_position)?;
 
         let targets_with_hash: Vec<(u64, Hash)> = self
             .targets
@@ -876,13 +913,19 @@ impl<Hash: AccumulatorHash> Proof<Hash> {
 
         let (targets, _): (Vec<_>, Vec<_>) = targets_with_hash.iter().cloned().unzip();
         let proof_positions =
-            util::get_proof_positions(&self.targets, num_leaves, util::tree_rows(num_leaves));
+            util::get_proof_positions(
+                &self.targets,
+                num_leaves,
+                util::tree_rows(num_leaves).map_err(ProofError::from_position)?,
+            )
+            .map_err(ProofError::from_position)?;
 
         let old_proof: Vec<_> = proof_positions.iter().zip(self.hashes.iter()).collect();
 
         let mut new_proof = vec![];
         // Grab all the positions of the needed proof hashes.
-        let needed_pos = util::get_proof_positions(&targets, num_leaves, total_rows);
+        let needed_pos = util::get_proof_positions(&targets, num_leaves, total_rows)
+            .map_err(ProofError::from_position)?;
 
         let old_proof_iter = old_proof.iter();
         // Loop through old_proofs and only add the needed proof hashes.
@@ -946,10 +989,11 @@ impl<Hash: AccumulatorHash> Proof<Hash> {
         num_leaves: u64,
         append_roots: bool,
     ) -> Result<Vec<(u64, Hash)>, ProofError> {
-        let total_rows = util::tree_rows(num_leaves);
+        let total_rows = util::tree_rows(num_leaves).map_err(ProofError::from_position)?;
         let mut new_positions = vec![];
 
-        let block_targets = util::detwin(block_targets.to_owned(), total_rows);
+        let block_targets = util::detwin(block_targets.to_owned(), total_rows)
+            .map_err(ProofError::from_position)?;
 
         for (position, hash) in old_positions {
             if hash.is_empty() {
@@ -957,19 +1001,26 @@ impl<Hash: AccumulatorHash> Proof<Hash> {
             }
             let mut next_pos = *position;
             for target in block_targets.iter() {
-                if util::is_root_position(next_pos, num_leaves, total_rows) {
+                if util::is_root_position(next_pos, num_leaves, total_rows)
+                    .map_err(ProofError::from_position)?
+                {
                     break;
                 }
                 // If these positions are in different subtrees, continue.
-                let (sub_tree, _, _) = util::detect_offset(*target, num_leaves);
-                let (sub_tree1, _, _) = util::detect_offset(next_pos, num_leaves);
+                let (sub_tree, _, _) = util::detect_offset(*target, num_leaves)
+                    .map_err(ProofError::from_position)?;
+                let (sub_tree1, _, _) = util::detect_offset(next_pos, num_leaves)
+                    .map_err(ProofError::from_position)?;
                 if sub_tree != sub_tree1 {
                     continue;
                 }
 
-                let is_ancestor =
-                    util::is_ancestor(util::parent(*target, total_rows), next_pos, total_rows)
-                        .map_err(|_| ProofError::MissingSibling(next_pos))?;
+                let is_ancestor = util::is_ancestor(
+                    util::parent(*target, total_rows).map_err(ProofError::from_position)?,
+                    next_pos,
+                    total_rows,
+                )
+                .map_err(|_| ProofError::MissingSibling(next_pos))?;
 
                 if is_ancestor {
                     next_pos = util::calc_next_pos(next_pos, *target, total_rows)
@@ -977,7 +1028,10 @@ impl<Hash: AccumulatorHash> Proof<Hash> {
                 }
             }
 
-            if append_roots || !util::is_root_position(next_pos, num_leaves, total_rows) {
+            if append_roots
+                || !util::is_root_position(next_pos, num_leaves, total_rows)
+                    .map_err(ProofError::from_position)?
+            {
                 new_positions.push((next_pos, *hash));
             }
         }
@@ -1474,6 +1528,14 @@ mod tests {
     }
 
     #[test]
+    fn test_calculate_hashes_delete_rejects_out_of_range_target() {
+        let proof = Proof::<BitcoinNodeHash>::new(vec![u64::MAX], vec![]);
+        let del_hashes = vec![(BitcoinNodeHash::empty(), BitcoinNodeHash::empty())];
+        let res = proof.calculate_hashes_delete(&del_hashes, 0);
+        assert_eq!(res, Err(ProofError::InvalidPosition));
+    }
+
+    #[test]
     fn test_deserialize_rejects_excessive_lengths() {
         let mut buf = vec![];
         buf.extend_from_slice(&(u64::MAX).to_le_bytes());
@@ -1589,6 +1651,22 @@ mod tests {
 
             assert_eq!(s.verify(&proof, &set_hashes), Ok(true));
         }
+    }
+
+    #[test]
+    fn test_verify_rejects_out_of_range_target() {
+        let proof = Proof::<BitcoinNodeHash>::new(vec![u64::MAX], vec![]);
+        let del_hashes = vec![BitcoinNodeHash::empty()];
+        let res = proof.verify(&del_hashes, &[], 0);
+        assert_eq!(res, Err(ProofError::InvalidPosition));
+    }
+
+    #[test]
+    fn test_verify_rejects_excessive_num_leaves() {
+        let proof = Proof::<BitcoinNodeHash>::new(vec![0], vec![]);
+        let del_hashes = vec![BitcoinNodeHash::empty()];
+        let res = proof.verify(&del_hashes, &[], (1 << 63) + 1);
+        assert_eq!(res, Err(ProofError::InvalidPosition));
     }
 
     #[test]

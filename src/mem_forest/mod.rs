@@ -289,6 +289,7 @@ impl<Hash: AccumulatorHash> MemForest<Hash> {
             Ok(u64::from_le_bytes(buf))
         }
         let leaves = read_u64(&mut reader)?;
+        tree_rows(leaves).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         let roots_len = read_u64(&mut reader)?;
         let mut roots = Vec::new();
         let mut map = HashMap::with_hasher(Default::default());
@@ -331,17 +332,17 @@ impl<Hash: AccumulatorHash> MemForest<Hash> {
 
             positions.push(position);
         }
-        let needed = get_proof_positions(&positions, self.leaves, tree_rows(self.leaves));
+        let needed = get_proof_positions(&positions, self.leaves, tree_rows(self.leaves)?)?;
         let proof = needed
             .iter()
             .map(|pos| self.get_hash(*pos).unwrap())
             .collect::<Vec<_>>();
 
-        let tree_rows = tree_rows(self.leaves);
+        let tree_rows = tree_rows(self.leaves)?;
         let translated_targets = positions
             .into_iter()
             .map(|pos| translate(pos, tree_rows, MAX_FOREST_ROWS))
-            .collect();
+            .collect::<Result<Vec<_>, _>>()?;
 
         Ok(Proof::new_with_hash(translated_targets, proof))
     }
@@ -395,7 +396,7 @@ impl<Hash: AccumulatorHash> MemForest<Hash> {
         &self,
         pos: u64,
     ) -> Result<(Rc<Node<Hash>>, Rc<Node<Hash>>, Rc<Node<Hash>>), String> {
-        let (tree, branch_len, bits) = detect_offset(pos, self.leaves);
+        let (tree, branch_len, bits) = detect_offset(pos, self.leaves)?;
         let mut n = Some(self.roots[tree as usize].clone());
         let mut sibling = Some(self.roots[tree as usize].clone());
         let mut parent = sibling.clone();
@@ -497,11 +498,11 @@ impl<Hash: AccumulatorHash> MemForest<Hash> {
             node = parent.upgrade().ok_or("could not upgrade parent")?;
         }
         let mut root_idx = self.roots.len() - 1;
-        let forest_rows = tree_rows(self.leaves);
+        let forest_rows = tree_rows(self.leaves)?;
         let mut root_row = None;
         // Find the root of the tree that the node belongs to
         for row in 0..=forest_rows {
-            if is_root_populated(row, self.leaves) {
+            if is_root_populated(row, self.leaves)? {
                 let root = &self.roots[root_idx];
                 if root.get_data() == node.get_data() {
                     root_row = Some(row);
@@ -514,15 +515,15 @@ impl<Hash: AccumulatorHash> MemForest<Hash> {
         let root_row = root_row.ok_or(format!(
             "Could not find the root position for row {root_idx}"
         ))?;
-        let mut pos = root_position(self.leaves, root_row, forest_rows);
+        let mut pos = root_position(self.leaves, root_row, forest_rows)?;
         for _ in 0..rows_to_top {
             // If LSB is 0, go left, otherwise go right
             match left_child_indicator & 1 {
                 0 => {
-                    pos = left_child(pos, forest_rows);
+                    pos = left_child(pos, forest_rows)?;
                 }
                 1 => {
-                    pos = right_child(pos, forest_rows);
+                    pos = right_child(pos, forest_rows)?;
                 }
                 _ => unreachable!(),
             }
@@ -612,6 +613,11 @@ impl<Hash: AccumulatorHash> MemForest<Hash> {
         if self.map.contains_key(&value) {
             return Err(format!("add_single: duplicate leaf hash {value}"));
         }
+        let next_leaves = self
+            .leaves
+            .checked_add(1)
+            .ok_or_else(|| "add_single: leaf count overflow".to_string())?;
+        tree_rows(next_leaves)?;
 
         let mut node: Rc<Node<Hash>> = Rc::new(Node {
             ty: NodeType::Leaf,
@@ -623,7 +629,9 @@ impl<Hash: AccumulatorHash> MemForest<Hash> {
         self.map.insert(value, Rc::downgrade(&node));
         let mut leaves = self.leaves;
         while leaves & 1 != 0 {
-            let root = self.roots.pop().unwrap();
+            let root = self.roots.pop().ok_or_else(|| {
+                "add_single: missing root while merging upward".to_string()
+            })?;
             if root.get_data() == AccumulatorHash::empty() {
                 leaves >>= 1;
                 continue;
@@ -645,7 +653,7 @@ impl<Hash: AccumulatorHash> MemForest<Hash> {
             leaves >>= 1;
         }
         self.roots.push(node);
-        self.leaves += 1;
+        self.leaves = next_leaves;
         Ok(())
     }
 
@@ -669,7 +677,10 @@ impl<Hash: AccumulatorHash> MemForest<Hash> {
         if self.leaves == 0 {
             return "empty".to_owned();
         }
-        let fh = tree_rows(self.leaves);
+        let fh = match tree_rows(self.leaves) {
+            Ok(rows) => rows,
+            Err(_) => return format!("invalid leaf count {}", self.leaves),
+        };
         // The accumulator should be less than 6 rows.
         if fh > 6 {
             let s = format!("Can't print {} leaves. roots: \n", self.leaves);
@@ -1187,6 +1198,15 @@ mod test {
     }
 
     #[test]
+    fn test_deserialize_rejects_excessive_leaves() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&((1u64 << 63) + 1).to_le_bytes());
+        buf.extend_from_slice(&0u64.to_le_bytes());
+        let res = MemForest::<BitcoinNodeHash>::deserialize(&*buf);
+        assert!(res.is_err());
+    }
+
+    #[test]
     fn test_deserialize_rejects_invalid_node_type() {
         let mut buf = Vec::new();
         buf.extend_from_slice(&1u64.to_le_bytes()); // leaves
@@ -1222,4 +1242,12 @@ mod test {
         assert_eq!(stump.verify(&proof, &[b]), Ok(true));
     }
 
+    #[test]
+    fn test_modify_rejects_excessive_leaf_count() {
+        let mut p = MemForest::<BitcoinNodeHash>::new();
+        p.leaves = 1 << 63;
+        let res = p.modify(&[BitcoinNodeHash::from([1; 32])], &[]);
+        assert!(res.is_err());
+        assert_eq!(p.leaves, 1 << 63);
+    }
 }
