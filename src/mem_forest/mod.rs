@@ -196,7 +196,7 @@ impl<Hash: AccumulatorHash> Node<Hash> {
 
 /// The actual MemForest accumulator, it implements all methods required to update the forest
 /// and to prove/verify membership.
-#[derive(Default, Clone)]
+#[derive(Default)]
 pub struct MemForest<Hash: AccumulatorHash = BitcoinNodeHash> {
     /// The roots of the forest, all leaves are children of these roots, and therefore
     /// owned by them.
@@ -207,6 +207,21 @@ pub struct MemForest<Hash: AccumulatorHash = BitcoinNodeHash> {
     /// A map of all nodes in the forest, indexed by their hash, this is used to lookup
     /// leaves when proving membership.
     map: HashMap<Hash, Weak<Node<Hash>>>,
+}
+
+/// Deep clone via serialize/deserialize.
+///
+/// Nodes are shared through `Rc` + interior mutability (`RefCell`/`Cell`). A derived
+/// `Clone` would only bump refcounts, so mutating one forest would corrupt any alias.
+/// Round-tripping through the wire format rebuilds an independent tree and leaf map.
+impl<Hash: AccumulatorHash> Clone for MemForest<Hash> {
+    fn clone(&self) -> Self {
+        let mut buf = Vec::new();
+        self.serialize(&mut buf)
+            .expect("MemForest::clone: serialize in-memory buffer");
+        Self::deserialize(buf.as_slice())
+            .expect("MemForest::clone: deserialize roundtrip")
+    }
 }
 
 impl MemForest {
@@ -481,40 +496,44 @@ impl<Hash: AccumulatorHash> MemForest<Hash> {
             let parent_left = parent
                 .upgrade()
                 .and_then(|parent| parent.left.clone().into_inner())
-                .ok_or("Could not upgrade parent")?
-                .clone();
+                .ok_or("Could not upgrade parent")?;
 
-            // If the current node is a left child, we left-shift the indicator
-            // and leave the LSB as 0
-            if parent_left.get_data() == node.get_data() {
+            // Pointer identity: hash equality is wrong after sibling promote /
+            // empty roots, and matches Pollard's get_pos.
+            if Rc::ptr_eq(&parent_left, &node) {
                 left_child_indicator <<= 1;
             } else {
-                // If the current node is a right child, we left-shift the indicator
-                // and set the LSB to 1
                 left_child_indicator <<= 1;
                 left_child_indicator |= 1;
             }
             rows_to_top += 1;
             node = parent.upgrade().ok_or("could not upgrade parent")?;
         }
-        let mut root_idx = self.roots.len() - 1;
+        let mut root_idx = self
+            .roots
+            .len()
+            .checked_sub(1)
+            .ok_or_else(|| "get_pos: forest has no roots".to_string())?;
         let forest_rows = tree_rows(self.leaves)?;
         let mut root_row = None;
-        // Find the root of the tree that the node belongs to
+        // Roots are packed highest-row-first; walk rows low-to-high while matching
+        // from the end of `roots`.
         for row in 0..=forest_rows {
             if is_root_populated(row, self.leaves)? {
                 let root = &self.roots[root_idx];
-                if root.get_data() == node.get_data() {
+                if Rc::ptr_eq(root, &node) {
                     root_row = Some(row);
                     break;
                 }
-                root_idx -= 1;
+                root_idx = root_idx.checked_sub(1).ok_or_else(|| {
+                    "get_pos: root index underflow while matching climbed node".to_string()
+                })?;
             }
         }
 
-        let root_row = root_row.ok_or(format!(
-            "Could not find the root position for row {root_idx}"
-        ))?;
+        let root_row = root_row.ok_or_else(|| {
+            "get_pos: climbed node is not present in forest roots".to_string()
+        })?;
         let mut pos = root_position(self.leaves, root_row, forest_rows)?;
         for _ in 0..rows_to_top {
             // If LSB is 0, go left, otherwise go right
@@ -1249,5 +1268,26 @@ mod test {
         let res = p.modify(&[BitcoinNodeHash::from([1; 32])], &[]);
         assert!(res.is_err());
         assert_eq!(p.leaves, 1 << 63);
+    }
+
+    /// Clone must not alias the Rc graph: mutate the clone, original stays proveable.
+    #[test]
+    fn test_clone_independent_of_mutate() {
+        let a = BitcoinNodeHash::from([1; 32]);
+        let b = BitcoinNodeHash::from([2; 32]);
+        let mut original = MemForest::<BitcoinNodeHash>::new();
+        original.modify(&[a, b], &[]).unwrap();
+
+        let mut cloned = original.clone();
+        cloned.modify(&[], &[a]).unwrap();
+
+        let proof = original
+            .prove(&[a, b])
+            .expect("original must still prove both leaves after clone mutate");
+        assert_eq!(original.verify(&proof, &[a, b]), Ok(true));
+        assert_eq!(original.leaves, 2);
+        assert_eq!(cloned.leaves, 2);
+        assert!(cloned.prove(&[a]).is_err());
+        assert!(cloned.prove(&[b]).is_ok());
     }
 }
