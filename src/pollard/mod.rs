@@ -622,7 +622,10 @@ impl<Hash: AccumulatorHash> Pollard<Hash> {
         proof: &Proof<Hash>,
         del_hashes: &[Hash],
     ) -> Result<bool, PollardError<Hash>> {
-        let roots = self.roots();
+        // `Proof::verify` expects Stump/MemForest root order (highest row
+        // first). `roots()` is ascending row order, so reverse for matching.
+        let mut roots = self.roots();
+        roots.reverse();
         proof
             .verify(del_hashes, &roots, self.leaves)
             .map_err(|_| PollardError::InvalidProof)
@@ -634,7 +637,8 @@ impl<Hash: AccumulatorHash> Pollard<Hash> {
         del_hashes: &[Hash],
         remembers: &[u64],
     ) -> Result<(), PollardError<Hash>> {
-        let roots = self.roots();
+        let mut roots = self.roots();
+        roots.reverse();
         proof
             .verify(del_hashes, &roots, self.leaves)
             .map_err(|_| PollardError::InvalidProof)
@@ -1536,6 +1540,55 @@ mod tests {
         let roots = p.roots().iter().copied().rev().collect::<Vec<_>>();
         assert_eq!(roots.len(), case.expected_roots.len());
         assert_eq!(expected_roots, roots, "Test case failed {case:?}");
+    }
+
+    /// `Pollard::roots()` is ascending row order; Stump/MemForest store highest
+    /// row first. `Proof::verify` walks that Stump order, so multi-root forests
+    /// used to make `Pollard::verify` return `Ok(false)` for valid proofs.
+    /// Regression for accumulator_crosscheck crash-7527ac2e.
+    #[test]
+    fn test_verify_multi_root_matches_stump_order() {
+        use crate::mem_forest::MemForest;
+        use crate::stump::Stump;
+
+        // 7 leaves => three roots (rows 0,1,2); order divergence matters.
+        let hashes: Vec<_> = (1u8..=7).map(hash_from_u8).collect();
+
+        let mut mem = MemForest::<BitcoinNodeHash>::new();
+        let mut pollard = Pollard::<BitcoinNodeHash>::new();
+        let (stump, _) = Stump::new()
+            .modify(&hashes, &[], &Proof::default())
+            .unwrap();
+
+        mem.modify(&hashes, &[]).unwrap();
+        let batch: Vec<_> = hashes
+            .iter()
+            .copied()
+            .map(|hash| PollardAddition {
+                hash,
+                remember: true,
+            })
+            .collect();
+        pollard
+            .modify(&batch, &[], Proof::default())
+            .unwrap();
+
+        assert_ne!(
+            stump.roots,
+            pollard.roots(),
+            "precondition: stump and pollard root order must differ"
+        );
+
+        let dels = [hashes[2], hashes[6], hashes[5], hashes[1], hashes[0]];
+        let proof = mem.prove(&dels).unwrap();
+
+        assert_eq!(stump.verify(&proof, &dels), Ok(true));
+        assert_eq!(mem.verify(&proof, &dels), Ok(true));
+        assert_eq!(
+            pollard.verify(&proof, &dels),
+            Ok(true),
+            "pollard must accept mem proof despite ascending roots()"
+        );
     }
 
     #[test]
