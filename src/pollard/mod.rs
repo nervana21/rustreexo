@@ -1785,6 +1785,153 @@ mod tests {
         assert_eq!(pollard.roots(), mem_roots);
     }
 
+    /// Deleting every leaf in a 4-leaf forest with unsorted proof targets must
+    /// still succeed. `MemForest::prove` can emit targets out of order; `detwin`
+    /// has to sort before collapsing sibling pairs, or Pollard tries to delete
+    /// each leaf and hits `SiblingNotFound` after the first promote. Regression
+    /// for accumulator_crosscheck crash-130cae.
+    #[test]
+    fn test_modify_delete_all_unsorted_targets() {
+        use crate::mem_forest::MemForest;
+
+        let hashes = [
+            hash_from_u8(0x41),
+            hash_from_u8(0x02),
+            hash_from_u8(0x27),
+            hash_from_u8(0x31),
+        ];
+
+        let mut mem = MemForest::<BitcoinNodeHash>::new();
+        let mut pollard = Pollard::<BitcoinNodeHash>::new();
+
+        mem.modify(&hashes, &[]).unwrap();
+        let batch: Vec<_> = hashes
+            .iter()
+            .copied()
+            .map(|hash| PollardAddition {
+                hash,
+                remember: true,
+            })
+            .collect();
+        pollard
+            .modify(&batch, &[], Proof::default())
+            .unwrap();
+
+        // Prove in position order 2,1,3,0 so targets are unsorted.
+        let dels = [hashes[2], hashes[1], hashes[3], hashes[0]];
+        let proof = mem.prove(&dels).unwrap();
+        assert_eq!(proof.targets, vec![2, 1, 3, 0]);
+
+        mem.modify(&[], &dels).unwrap();
+        pollard
+            .modify(&[], &dels, proof)
+            .expect("delete all leaves with unsorted targets");
+
+        let mem_roots = mem
+            .get_roots()
+            .iter()
+            .map(|root| root.get_data())
+            .collect::<Vec<_>>();
+        assert_eq!(pollard.roots(), mem_roots);
+    }
+
+    /// After deletes promote survivors off row 0, a later batch can mix row-0
+    /// leaves with higher-row targets. Collapsing early siblings must keep the
+    /// parent queue sorted so a newly produced parent can pair with an existing
+    /// sibling (else Pollard hits `SiblingNotFound`). Regression for
+    /// accumulator_crosscheck crash-a58e0a.
+    #[test]
+    fn test_modify_delete_after_promote_keeps_detwin_sorted() {
+        use crate::mem_forest::MemForest;
+
+        // Match the crash sequence: add 7, delete {1,2,3,4}, add 3, delete 5
+        // of the remaining 6 (promoted + new leaves mixed).
+        let first: Vec<_> = [0x40u8, 0xfa, 0xfe, 0x89, 0xe1, 0xd3, 0xbe]
+            .iter()
+            .copied()
+            .map(hash_from_u8)
+            .collect();
+        let second: Vec<_> = [0xe9u8, 0xa9, 0x4a]
+            .iter()
+            .copied()
+            .map(hash_from_u8)
+            .collect();
+
+        let mut mem = MemForest::<BitcoinNodeHash>::new();
+        let mut pollard = Pollard::<BitcoinNodeHash>::new();
+
+        mem.modify(&first, &[]).unwrap();
+        let batch: Vec<_> = first
+            .iter()
+            .copied()
+            .map(|hash| PollardAddition {
+                hash,
+                remember: true,
+            })
+            .collect();
+        pollard
+            .modify(&batch, &[], Proof::default())
+            .unwrap();
+
+        let dels1 = [first[1], first[3], first[4], first[2]];
+        let proof = mem.prove(&dels1).unwrap();
+        mem.modify(&[], &dels1).unwrap();
+        pollard.modify(&[], &dels1, proof).unwrap();
+
+        mem.modify(&second, &[]).unwrap();
+        let batch: Vec<_> = second
+            .iter()
+            .copied()
+            .map(|hash| PollardAddition {
+                hash,
+                remember: true,
+            })
+            .collect();
+        pollard
+            .modify(&batch, &[], Proof::default())
+            .unwrap();
+
+        // Remaining after first delete: first[0], first[5], first[6], plus second.
+        // Delete five of six in the crash order (session idxs 0,2,4,1,3).
+        let remaining = [
+            first[0], first[5], first[6], second[0], second[1], second[2],
+        ];
+        let dels2 = [
+            remaining[0],
+            remaining[2],
+            remaining[4],
+            remaining[1],
+            remaining[3],
+        ];
+        let proof = mem.prove(&dels2).unwrap();
+        assert_eq!(
+            proof.targets,
+            vec![13835058055282163712, 6, 8, 9223372036854775810, 7]
+        );
+
+        mem.modify(&[], &dels2).unwrap();
+        pollard
+            .modify(&[], &dels2, proof)
+            .expect("delete mixed promoted + row-0 targets");
+
+        // Empty placeholder slots differ between Pollard and MemForest; compare
+        // the non-empty root set (same as fuzz assert_roots_match).
+        let mut pollard_roots: Vec<_> = pollard
+            .roots()
+            .into_iter()
+            .filter(|h| !h.is_empty())
+            .collect();
+        let mut mem_roots: Vec<_> = mem
+            .get_roots()
+            .iter()
+            .map(|root| root.get_data())
+            .filter(|h| !h.is_empty())
+            .collect();
+        pollard_roots.sort_unstable();
+        mem_roots.sort_unstable();
+        assert_eq!(pollard_roots, mem_roots);
+    }
+
     #[test]
     fn test_delete_roots_child() {
         // Assuming the following tree:
@@ -1941,6 +2088,12 @@ mod tests {
             .collect()
     }
 
+    #[test]
+    fn test_detect_offset_rejects_out_of_range_position() {
+        let res = Pollard::<BitcoinNodeHash>::detect_offset(3, 3);
+        assert!(matches!(res, Err(PollardError::InvalidPosition)));
+    }
+
     /// Regression: pollard_stateful crash-7799d8b0… — add four leaves with three
     /// identical hashes, then delete one. Hash-based sibling checks treated the
     /// target as its own sibling and `migrate_up` / `recompute_hashes` stack
@@ -1976,12 +2129,6 @@ mod tests {
         let proof = p.prove_single(b).expect("prove last duplicate");
         p.modify(&[], &[b], proof).expect("delete duplicate leaf");
         assert_eq!(p.leaves(), 4);
-    }
-
-    #[test]
-    fn test_detect_offset_rejects_out_of_range_position() {
-        let res = Pollard::<BitcoinNodeHash>::detect_offset(3, 3);
-        assert!(matches!(res, Err(PollardError::InvalidPosition)));
     }
 
     #[test]

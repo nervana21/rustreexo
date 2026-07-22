@@ -133,8 +133,15 @@ pub fn calc_next_pos(position: u64, del_pos: u64, forest_rows: u8) -> Result<u64
     Ok(higher_bits | lower_bits)
 }
 
+/// Collapse sibling delete targets up to their parents.
+///
+/// Targets need not be sorted; this sorts first. Sibling detection walks the
+/// list left-to-right and only sees pairs when they sit adjacent. Collapsed
+/// parents are inserted in sorted order so later sibling pairs (including a
+/// parent produced by an earlier collapse) stay adjacent for the next pass.
 pub fn detwin(nodes: Vec<u64>, forest_rows: u8) -> Result<Vec<u64>, String> {
     let mut computed: Vec<u64> = nodes;
+    computed.sort_unstable();
     let mut detwinned = Vec::new();
 
     loop {
@@ -154,12 +161,13 @@ pub fn detwin(nodes: Vec<u64>, forest_rows: u8) -> Result<Vec<u64>, String> {
 
         if next == sibling {
             let parent = parent(node, forest_rows)?;
-
-            if computed.binary_search(&parent).is_err() {
-                computed.push(parent);
-            }
-
+            // Drop the sibling while it is still at the front, then insert the
+            // parent in sorted order. Pushing unsorted breaks adjacency for
+            // higher-row pairs (e.g. 18/19 after collapsing 6/7).
             computed.remove(0);
+            if let Err(idx) = computed.binary_search(&parent) {
+                computed.insert(idx, parent);
+            }
             continue;
         }
 
@@ -657,6 +665,20 @@ mod tests {
         let targets = vec![4, 6, 8, 9];
         let targets = super::detwin(targets, 3).unwrap();
         assert_eq!(targets, vec![4, 6, 12]);
+
+        // Unsorted full-tree delete must still collapse to the root. Without a
+        // sort, sibling pairs are not adjacent and detwin returns every leaf.
+        let targets = vec![2, 1, 3, 0];
+        let targets = super::detwin(targets, 2).unwrap();
+        assert_eq!(targets, vec![6]);
+
+        // Parent from an earlier collapse must stay sorted so it can pair with
+        // an existing sibling, and that parent may then pair with another
+        // target at the same row. Without insert-in-order, [6,7] -> 19 lands at
+        // the end and 18/19 never collapse (accumulator_crosscheck crash-a58e).
+        let targets = vec![24, 6, 8, 18, 7];
+        let targets = super::detwin(targets, 4).unwrap();
+        assert_eq!(targets, vec![8, 28]);
     }
 
     #[test]
