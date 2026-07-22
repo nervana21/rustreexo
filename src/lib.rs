@@ -53,6 +53,20 @@ extern crate alloc;
 /// That should save you the trouble.
 pub(crate) const MAX_FOREST_ROWS: u8 = 63;
 
+/// Caps how many sibling hashes a deserialized [`proof::Proof`] may carry.
+/// This keeps [`proof::Proof::deserialize`] from allocating a hash vector big enough to
+/// use as a denial-of-service footgun.
+pub(crate) const MAX_PROOF_HASH_COUNT: u64 = 1 << 17;
+
+/// Caps how many leaf positions a deserialized [`proof::Proof`] may claim to prove.
+/// This keeps [`proof::Proof::deserialize`] from allocating a target vector larger than
+/// any proof that could ever ride on a real transaction.
+pub(crate) const MAX_PROOF_TARGET_COUNT: u64 = 1 << 16;
+
+/// Initial `Vec` capacity for [`proof::Proof::deserialize`]. Untrusted length prefixes
+/// must not be used to pre-allocate the full claimed size.
+pub(crate) const PROOF_DESERIALIZE_INITIAL_CAP: usize = 64;
+
 #[cfg(not(feature = "std"))]
 /// Re-exports `alloc` basics plus HashMap/HashSet and IO traits.
 pub mod prelude {
