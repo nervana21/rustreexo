@@ -53,6 +53,31 @@ extern crate alloc;
 /// That should save you the trouble.
 pub(crate) const MAX_FOREST_ROWS: u8 = 63;
 
+/// Max transaction base bytes in one Bitcoin block.
+///
+/// Consensus: block weight ≤ 4_000_000 and weight ≥ 4 × base_size, so base_size ≤ 1_000_000.
+const MAX_BLOCK_BASE_BYTES: u64 = 1_000_000;
+
+/// Minimum serialized `CTxIn` size in base block bytes:
+/// 32-byte prevout hash + 4-byte prevout index + 1-byte empty `scriptSig` CompactSize +
+/// 4-byte `nSequence`.
+const MIN_TXIN_BASE_BYTES: u64 = 41;
+
+/// Caps how many leaf positions a deserialized [`proof::Proof`] may claim to prove.
+///
+/// A Bitcoin block cannot contain more spends than `MAX_BLOCK_BASE_BYTES / MIN_TXIN_BASE_BYTES`
+/// (coinbase and other non-input bytes only tighten this). Reject above that before allocating
+/// so an untrusted length prefix cannot OOM the process.
+///
+/// Hash count is capped separately in [`proof::Proof::deserialize`] as
+/// `targets_len * MAX_FOREST_ROWS`: [`util::get_proof_positions`] needs at most one sibling
+/// per target per row of ascent.
+pub(crate) const MAX_PROOF_TARGET_COUNT: u64 = MAX_BLOCK_BASE_BYTES / MIN_TXIN_BASE_BYTES;
+
+/// Initial `Vec` capacity for [`proof::Proof::deserialize`]. Untrusted length prefixes
+/// must not be used to pre-allocate the full claimed size.
+pub(crate) const PROOF_DESERIALIZE_INITIAL_CAP: usize = 64;
+
 #[cfg(not(feature = "std"))]
 /// Re-exports `alloc` basics plus HashMap/HashSet and IO traits.
 pub mod prelude {

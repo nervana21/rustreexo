@@ -78,6 +78,8 @@ use super::util::tree_rows;
 use crate::prelude::*;
 use crate::util::translate;
 use crate::MAX_FOREST_ROWS;
+use crate::MAX_PROOF_TARGET_COUNT;
+use crate::PROOF_DESERIALIZE_INITIAL_CAP;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 /// Errors that can occur when working with a [Proof].
@@ -459,15 +461,25 @@ impl<Hash: AccumulatorHash> Proof<Hash> {
     /// assert_eq!(Proof::default(), deserialized_proof);
     /// ```
     pub fn deserialize<Source: Read>(mut buf: Source) -> Result<Self, ProofError> {
-        let targets_len = read_u64(&mut buf).map_err(|e| ProofError::Io(e.kind()))? as usize;
+        let targets_len = read_u64(&mut buf).map_err(|e| ProofError::Io(e.kind()))?;
+        if targets_len > MAX_PROOF_TARGET_COUNT {
+            return Err(ProofError::InvalidTarget);
+        }
+        let targets_len = targets_len as usize;
 
-        let mut targets = Vec::with_capacity(targets_len);
+        let mut targets = Vec::with_capacity(targets_len.min(PROOF_DESERIALIZE_INITIAL_CAP));
         for _ in 0..targets_len {
             targets.push(read_u64(&mut buf).map_err(|_| ProofError::InvalidTarget)?);
         }
 
-        let hashes_len = read_u64(&mut buf).map_err(|e| ProofError::Io(e.kind()))? as usize;
-        let mut hashes = Vec::with_capacity(hashes_len);
+        let hashes_len = read_u64(&mut buf).map_err(|e| ProofError::Io(e.kind()))?;
+        // Valid proofs need at most one sibling hash per target per forest row.
+        let max_hashes = (targets_len as u64).saturating_mul(MAX_FOREST_ROWS as u64);
+        if hashes_len > max_hashes {
+            return Err(ProofError::InvalidHash);
+        }
+        let hashes_len = hashes_len as usize;
+        let mut hashes = Vec::with_capacity(hashes_len.min(PROOF_DESERIALIZE_INITIAL_CAP));
         for _ in 0..hashes_len {
             let hash = Hash::read(&mut buf).map_err(|_| ProofError::InvalidHash)?;
             hashes.push(hash);
@@ -1461,6 +1473,25 @@ mod tests {
             .collect();
         assert_eq!(roots, vec![(expected_root_old, expected_root_new)]);
         assert_eq!(computed, expected_computed);
+    }
+
+    #[test]
+    fn test_deserialize_rejects_excessive_lengths() {
+        let mut buf = vec![];
+        buf.extend_from_slice(&(u64::MAX).to_le_bytes());
+        buf.extend_from_slice(&0u64.to_le_bytes());
+        let res = Proof::<BitcoinNodeHash>::deserialize(buf.as_slice());
+        assert_eq!(res, Err(ProofError::InvalidTarget));
+    }
+
+    #[test]
+    fn test_deserialize_rejects_excessive_hash_count() {
+        // Zero targets => at most zero hashes.
+        let mut buf = vec![];
+        buf.extend_from_slice(&0u64.to_le_bytes());
+        buf.extend_from_slice(&1u64.to_le_bytes());
+        let res = Proof::<BitcoinNodeHash>::deserialize(buf.as_slice());
+        assert_eq!(res, Err(ProofError::InvalidHash));
     }
 
     #[test]
